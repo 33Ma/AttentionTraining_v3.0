@@ -1,0 +1,33 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Qt Creator / IDE ----
+.qtcreator/
+*.user
+*.pro.user*
+
+# ---- Runtime / local data (never push: contains API keys & user data) ----
+users/
+users.json
+attention_data.db
+*.db
+*.log
+
+# ---- Build artifacts ----
+build/
+dist/
+*.exe
+*.dll
+*.so
+
+# ---- Local backup of old v2 git metadata ----
+.git.bak_v2/
