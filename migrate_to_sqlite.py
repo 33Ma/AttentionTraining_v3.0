@@ -192,6 +192,8 @@ def _parse_training_records(config: configparser.ConfigParser) -> List[Dict[str,
                 total_blinks = _to_int(config.get(section, prefix + "totalBlinks", fallback="0"))
                 game_score = _to_int(config.get(section, prefix + "gameScore", fallback="0"))
                 avg_ear = _to_float(config.get(section, prefix + "avgEAR", fallback="0"))
+                avg_gaze_score = _to_int(config.get(section, prefix + "avgGazeScore", fallback="0"))
+                avg_gaze_distance = _to_float(config.get(section, prefix + "avgGazeDistance", fallback="0"))
             else:
                 raw_date = config.get(section, prefix + "date_time", fallback="")
                 date_time = raw_date.strip()
@@ -202,6 +204,8 @@ def _parse_training_records(config: configparser.ConfigParser) -> List[Dict[str,
                 total_blinks = _to_int(config.get(section, prefix + "total_blinks", fallback="0"))
                 game_score = _to_int(config.get(section, prefix + "game_score", fallback="0"))
                 avg_ear = _to_float(config.get(section, prefix + "avg_ear", fallback="0"))
+                avg_gaze_score = _to_int(config.get(section, prefix + "avg_gaze_score", fallback="0"))
+                avg_gaze_distance = _to_float(config.get(section, prefix + "avg_gaze_distance", fallback="0"))
 
             if not date_time:
                 continue
@@ -220,6 +224,8 @@ def _parse_training_records(config: configparser.ConfigParser) -> List[Dict[str,
                     "total_blinks": total_blinks,
                     "game_score": game_score,
                     "avg_ear": avg_ear,
+                    "avg_gaze_score": avg_gaze_score,
+                    "avg_gaze_distance": avg_gaze_distance,
                 }
             )
 

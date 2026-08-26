@@ -7,6 +7,7 @@ from typing import List, Optional, Dict
 from PySide6.QtCore import QObject, Signal
 
 from .database import Database
+from .paths import app_data_dir
 
 
 class UserRole(Enum):
@@ -76,7 +77,7 @@ class UserManager(QObject):
         super().__init__()
         self._initialized = True
 
-        self.app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.app_dir = app_data_dir()
         self._db = Database()
         self._users: Dict[str, UserInfo] = {}
         self._passwords: Dict[str, str] = {}

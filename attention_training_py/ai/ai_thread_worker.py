@@ -33,7 +33,18 @@ class AIThreadWorker(QObject):
         self._finished = False
 
         if not api_key:
-            self.analysis_error.emit("API密钥未设置")
+            try:
+                from ai.local_analysis import LocalAnalysisEngine
+                from core.settings import GlobalSettings
+                local_analysis = LocalAnalysisEngine.instance().analyze_session(
+                    avg_attention, total_blinks, max_consecutive_hits,
+                    game_score, game_mode, duration_minutes,
+                    avg_gaze_score, avg_gaze_distance,
+                    use_model=GlobalSettings().local_analysis_enabled(),
+                )
+                self.analysis_ready.emit(local_analysis)
+            except Exception as e:
+                self.analysis_error.emit(f"本地分析失败: {str(e)}")
             self.finished.emit()
             self._finished = True
             return

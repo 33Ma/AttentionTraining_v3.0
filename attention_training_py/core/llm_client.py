@@ -192,7 +192,14 @@ class LLMClient(QObject):
     def recommend_training_mode(self, history: List[Dict[str, Any]]):
         """推荐训练模式"""
         if not self._enabled or not self._api_key:
-            self.recommendation_ready.emit("find_difference", "Normal")
+            try:
+                from ai.local_analysis import LocalAnalysisEngine
+                from core.settings import GlobalSettings
+                use_model = GlobalSettings().local_analysis_enabled()
+                mode, difficulty = LocalAnalysisEngine.instance().recommend_mode(history, use_model=use_model)
+                self.recommendation_ready.emit(mode, difficulty)
+            except Exception:
+                self.recommendation_ready.emit("find_difference", "Normal")
             return
 
         prompt = "根据以下训练历史，推荐最适合的游戏模式（find_difference或dynamic_tracking）和难度（Easy/Normal/Hard）：\n\n"

@@ -367,7 +367,7 @@ class TrainingWindow(QWidget):
             record.date_time = QDateTime.currentDateTime()
             record.duration_minutes = self._duration_minutes
             record.game_mode = self._game_mode
-            record.difficulty = settings.difficulty_level()
+            record.difficulty = settings.effective_difficulty_level()
             record.avg_attention_score = avg_attention
             record.total_blinks = self._total_blinks
             record.game_score = self._total_game_score

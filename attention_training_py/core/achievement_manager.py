@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import List, Dict, Optional
 from PySide6.QtCore import QObject, Signal, QDateTime, QMutex, QMutexLocker
 from .settings import GlobalSettings
+from .paths import app_data_dir
 
 
 class AchievementType(Enum):
@@ -81,7 +82,7 @@ class AchievementManager(QObject):
         super().__init__()
         self._initialized = True
 
-        self.app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.app_dir = app_data_dir()
         self._achievements: Dict[AchievementType, Achievement] = {}
         self._total_training_minutes = 0
         self._current_user = ""
@@ -309,7 +310,7 @@ class AchievementManager(QObject):
         if minutes <= 0:
             return
         self._total_training_minutes += minutes
-        self._check_training_duration_achievement(self._total_training_minutes)
+        self.check_training_duration_achievement(self._total_training_minutes)
         self._save_to_file_unsafe()
 
     def check_attention_achievement(self, attention_score: int):

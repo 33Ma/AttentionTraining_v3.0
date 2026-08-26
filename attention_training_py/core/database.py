@@ -3,6 +3,8 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Optional
 
+from .paths import app_data_dir, database_path
+
 
 DB_FILENAME = "attention_data.db"
 
@@ -28,7 +30,9 @@ CREATE TABLE IF NOT EXISTS training_records (
     avg_attention_score INTEGER NOT NULL DEFAULT 0,
     total_blinks INTEGER NOT NULL DEFAULT 0,
     game_score INTEGER NOT NULL DEFAULT 0,
-    avg_ear REAL NOT NULL DEFAULT 0.0
+    avg_ear REAL NOT NULL DEFAULT 0.0,
+    avg_gaze_score INTEGER NOT NULL DEFAULT 0,
+    avg_gaze_distance REAL NOT NULL DEFAULT 0.0
 );
 
 CREATE INDEX IF NOT EXISTS idx_training_records_username_datetime
@@ -50,8 +54,8 @@ class Database:
         if hasattr(self, "_initialized"):
             return
         self._initialized = True
-        self.app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self.db_path = os.path.join(self.app_dir, DB_FILENAME)
+        self.app_dir = app_data_dir()
+        self.db_path = database_path()
         self.initialize()
 
     @contextmanager
@@ -71,6 +75,21 @@ class Database:
     def initialize(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._ensure_column(
+                conn, "training_records", "avg_gaze_score",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(
+                conn, "training_records", "avg_gaze_distance",
+                "REAL NOT NULL DEFAULT 0.0",
+            )
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+        """Add a column to an existing table when it is missing (schema migration)."""
+        columns = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})")]
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def query(self, sql: str, params: Iterable[Any] = ()) -> List[Dict[str, Any]]:
         with self.connect() as conn:
@@ -130,7 +149,8 @@ class Database:
         return self.query(
             """
             SELECT date_time, duration_minutes, game_mode, difficulty,
-                   avg_attention_score, total_blinks, game_score, avg_ear
+                   avg_attention_score, total_blinks, game_score, avg_ear,
+                   avg_gaze_score, avg_gaze_distance
             FROM training_records
             WHERE username = ?
             ORDER BY date_time DESC, id DESC
@@ -147,8 +167,9 @@ class Database:
                 """
                 INSERT INTO training_records (
                     username, date_time, duration_minutes, game_mode, difficulty,
-                    avg_attention_score, total_blinks, game_score, avg_ear
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    avg_attention_score, total_blinks, game_score, avg_ear,
+                    avg_gaze_score, avg_gaze_distance
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -161,6 +182,8 @@ class Database:
                         record["total_blinks"],
                         record["game_score"],
                         record["avg_ear"],
+                        record.get("avg_gaze_score", 0),
+                        record.get("avg_gaze_distance", 0.0),
                     )
                     for record in records
                 ],

@@ -14,6 +14,7 @@ from PySide6.QtCharts import QChartView, QBarSeries, QBarSet, QBarCategoryAxis, 
 from core.user_manager import UserManager, UserRole
 from core.settings import GlobalSettings, TrainingRecord
 from core.user_session import UserSession
+from core.paths import app_data_dir
 
 
 class TeacherReportDialog(QDialog):
@@ -319,7 +320,7 @@ class TeacherReportDialog(QDialog):
 
             # 成就数
             achievement_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                app_data_dir(),
                 "users", student.username, "achievements.json"
             )
             if os.path.exists(achievement_path):

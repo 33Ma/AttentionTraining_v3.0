@@ -31,3 +31,9 @@ dist/
 
 # ---- Local backup of old v2 git metadata ----
 .git.bak_v2/
+
+# ---- Downloaded ONNX vision models (fetch via tools/download_vision_models.py) ----
+attention_training_py/models/vision/
+
+# ---- Packaged app archive ----
+App/dist.rar

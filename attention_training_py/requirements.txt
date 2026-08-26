@@ -1,1 +1,7 @@
-PySide6
+# ??????? - ???????
+PySide6>=6.5
+opencv-python
+mediapipe
+numpy
+requests
+onnxruntime-gpu>=1.29  # 默认纯 CPU 推理（模型为毫秒级）；如需 CUDA，请安装与系统 CUDA 匹配的 cuDNN/cuBLAS 并设置环境变量 ATTENTION_TRAINING_USE_GPU=1

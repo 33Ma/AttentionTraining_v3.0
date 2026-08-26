@@ -2,6 +2,7 @@
 import os
 from PySide6.QtCore import QObject, QUrl
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+from .paths import app_data_dir
 
 class SoundManager(QObject):
     _instance = None
@@ -27,7 +28,7 @@ class SoundManager(QObject):
 
     def _init_sound(self):
         # 尝试加载资源文件
-        app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        app_dir = app_data_dir()
         sound_path = os.path.join(app_dir, "resources", "feedback_sound.mp3")
 
         if os.path.exists(sound_path):

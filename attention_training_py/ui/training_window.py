@@ -248,6 +248,10 @@ class TrainingWindow(QWidget):
         try:
             self._camera_thread = QThread(self)
             self._camera_worker = CameraWorker()
+            # 应用EAR阈值设置：自适应模式下使用历史记录计算值，手动模式使用手动设定值
+            settings = GlobalSettings()
+            self._camera_worker.set_ear_threshold(settings.effective_ear_threshold())
+            self._camera_worker.set_adaptive_ear(settings.adaptive_ear())
             self._camera_worker.moveToThread(self._camera_thread)
 
             # 连接信号
@@ -352,7 +356,7 @@ class TrainingWindow(QWidget):
             pixmap = QPixmap.fromImage(frame)
             label_size = self._camera_label.size()
             if label_size.width() > 0 and label_size.height() > 0:
-                pixmap = pixmap.scaled(label_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                pixmap = pixmap.scaled(label_size, Qt.KeepAspectRatio, Qt.FastTransformation)
             self._camera_label.setPixmap(pixmap)
         except Exception as e:
             print(f"Update camera frame error: {e}")
@@ -509,189 +513,21 @@ class TrainingWindow(QWidget):
                                   max_consecutive_hits: int, game_score: int,
                                   game_mode: str, duration_minutes: int,
                                   avg_gaze_score: int = 0, avg_gaze_distance: float = 0.0) -> str:
-        """生成本地分析报告（当API不可用时）"""
-        mode_name = "找茬模式" if game_mode == "find_difference" else "动态追踪模式"
+        """生成本地分析报告（本地 ONNX 智能分析；模型不可用时回退规则模板）"""
+        from ai.local_analysis import LocalAnalysisEngine
+        from core.settings import GlobalSettings
+        return LocalAnalysisEngine.instance().analyze_session(
+            avg_attention,
+            total_blinks,
+            max_consecutive_hits,
+            game_score,
+            game_mode,
+            duration_minutes,
+            avg_gaze_score,
+            avg_gaze_distance,
+            use_model=GlobalSettings().local_analysis_enabled(),
+        )
 
-        if avg_attention >= 80:
-            attention_level = "🌟 卓越"
-        elif avg_attention >= 65:
-            attention_level = "✨ 优秀"
-        elif avg_attention >= 50:
-            attention_level = "📈 良好"
-        elif avg_attention >= 35:
-            attention_level = "📊 一般"
-        else:
-            attention_level = "🎯 待提升"
-
-        blink_rate = total_blinks // duration_minutes if duration_minutes > 0 else 0
-        if blink_rate <= 12:
-            blink_status = "✅ 正常"
-        elif blink_rate <= 20:
-            blink_status = "👌 良好"
-        elif blink_rate <= 30:
-            blink_status = "⚠️ 偏高"
-        else:
-            blink_status = "🔴 过高"
-
-        if max_consecutive_hits >= 20:
-            combo_status = "🏆 完美"
-        elif max_consecutive_hits >= 15:
-            combo_status = "⭐ 优秀"
-        elif max_consecutive_hits >= 10:
-            combo_status = "👍 良好"
-        elif max_consecutive_hits >= 5:
-            combo_status = "📈 一般"
-        else:
-            combo_status = "🎯 待提升"
-
-        max_possible = 500 if game_mode == "find_difference" else 800
-        score_ratio = game_score / max_possible if max_possible > 0 else 0
-        if score_ratio >= 0.8:
-            score_status = "🏆 出色"
-        elif score_ratio >= 0.6:
-            score_status = "⭐ 优秀"
-        elif score_ratio >= 0.4:
-            score_status = "👍 良好"
-        elif score_ratio >= 0.2:
-            score_status = "📈 一般"
-        else:
-            score_status = "🎯 待提升"
-
-        # 注视相关评估
-        if avg_gaze_score >= 90:
-            gaze_level = "🌟 非常专注"
-            gaze_suggestion = "视线非常稳定，展现了极佳的专注力！继续这样保持！"
-        elif avg_gaze_score >= 75:
-            gaze_level = "✨ 专注良好"
-            gaze_suggestion = "视线基本集中在屏幕中心，专注度不错！"
-        elif avg_gaze_score >= 55:
-            gaze_level = "📈 专注一般"
-            gaze_suggestion = "视线有轻微偏移，建议训练时尽量保持视线在屏幕中心。"
-        else:
-            gaze_level = "🎯 需要改进"
-            gaze_suggestion = "视线偏离较多，建议休息一下再继续训练，保持正对屏幕的姿势。"
-
-        gaze_distance_desc = ""
-        if avg_gaze_distance < 0.1:
-            gaze_distance_desc = "（非常集中，视线几乎未离开屏幕中心）"
-        elif avg_gaze_distance < 0.2:
-            gaze_distance_desc = "（良好，视线基本保持在屏幕中心附近）"
-        elif avg_gaze_distance < 0.3:
-            gaze_distance_desc = "（一般，有轻微视线偏移）"
-        else:
-            gaze_distance_desc = "（需要改善，视线经常离开屏幕中心）"
-
-        analysis = "📊 训练数据概览\n"
-        analysis += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        analysis += f"• 🧠 平均注意力分数：{avg_attention}/100（{attention_level}）\n"
-        analysis += f"• 👁️ 总眨眼次数：{total_blinks}次（频率：{blink_rate}次/分钟，状态：{blink_status}）\n"
-        analysis += f"• ⚡ 最高连击：{max_consecutive_hits}次（{combo_status}）\n"
-        analysis += f"• 🎮 游戏得分：{game_score}分（{score_status}）\n"
-        analysis += f"• 🎲 游戏模式：{mode_name}\n"
-        analysis += f"• ⏱️ 训练时长：{duration_minutes}分钟\n"
-        analysis += f"• 👀 注视专注度：{avg_gaze_score}/100（{gaze_level}）{gaze_distance_desc}\n\n"
-
-        analysis += "💡 分析建议\n"
-        analysis += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-
-        if avg_attention >= 70:
-            analysis += "✨ 注意力表现优秀！你展现了很强的专注能力，继续保持这个状态！\n"
-        elif avg_attention >= 50:
-            analysis += "📈 注意力表现良好，有不错的提升空间。继续保持训练，你会越来越好！\n"
-        else:
-            analysis += "🎯 注意力需要加强。建议在安静、无干扰的环境中进行训练，训练前做5分钟深呼吸。\n"
-
-        if max_consecutive_hits >= 15:
-            analysis += "⚡ 连击能力很强！你的反应速度和精准度都很出色，可以尝试挑战更高难度！\n"
-        elif max_consecutive_hits >= 8:
-            analysis += "🎯 连击表现不错，继续练习提高稳定性，目标是达到15次以上！\n"
-        else:
-            analysis += "🎯 连击有待提高。建议先注重准确率，再追求速度，逐步提升连击数。\n"
-
-        if blink_rate > 25:
-            analysis += "😴 眨眼频率较高，可能有些疲劳。建议训练中适时休息，每15分钟让眼睛放松一下。\n"
-        elif blink_rate < 10:
-            analysis += "👁️ 眨眼频率偏低，记得在训练中保持自然的眨眼习惯，避免眼睛干涩。\n"
-        else:
-            analysis += "👁️ 眨眼频率正常，状态良好！\n"
-
-        # 注视相关建议
-        analysis += f"\n👀 注视专注度分析：\n"
-        analysis += f"   {gaze_suggestion}\n"
-
-        if avg_gaze_distance >= 0.25:
-            analysis += "   💡 建议：调整坐姿，确保正对屏幕，眼睛与屏幕保持适当距离。\n"
-        elif avg_gaze_distance >= 0.15:
-            analysis += "   💡 建议：尝试在训练中时刻提醒自己关注屏幕中心区域。\n"
-        else:
-            analysis += "   💡 建议：继续保持良好的注视习惯！\n"
-
-        # 综合评分
-        overall_score = 0
-        if avg_attention >= 70:
-            overall_score += 30
-        elif avg_attention >= 50:
-            overall_score += 20
-        else:
-            overall_score += 10
-
-        if max_consecutive_hits >= 15:
-            overall_score += 25
-        elif max_consecutive_hits >= 8:
-            overall_score += 15
-        elif max_consecutive_hits >= 3:
-            overall_score += 8
-
-        if score_ratio >= 0.6:
-            overall_score += 25
-        elif score_ratio >= 0.3:
-            overall_score += 15
-        else:
-            overall_score += 5
-
-        if avg_gaze_score >= 75:
-            overall_score += 20
-        elif avg_gaze_score >= 55:
-            overall_score += 12
-        else:
-            overall_score += 5
-
-        analysis += f"\n🏆 综合评分：{overall_score}/100\n"
-
-        if overall_score >= 80:
-            analysis += "🌟🌟🌟🌟🌟 卓越表现！你是注意力训练大师！\n"
-        elif overall_score >= 65:
-            analysis += "🌟🌟🌟🌟 表现优秀，继续进步！\n"
-        elif overall_score >= 50:
-            analysis += "🌟🌟🌟 表现良好，坚持训练会更好！\n"
-        elif overall_score >= 35:
-            analysis += "🌟🌟 表现一般，继续加油！\n"
-        else:
-            analysis += "🌟 需要更多练习，相信自己会越来越好！\n"
-
-        analysis += "\n🌟 下次训练建议\n"
-        analysis += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        analysis += "• 保持规律的训练频率，每周3-4次效果最佳\n"
-        analysis += "• 训练前做5分钟深呼吸，帮助集中注意力\n"
-        analysis += "• 每次训练后适当休息，避免眼部疲劳\n"
-        analysis += "• 逐步增加训练时长和难度，循序渐进\n"
-        analysis += "• 训练时保持正对屏幕，视线集中在屏幕中心区域\n"
-
-        target_attention = min(100, avg_attention + 15)
-        target_combo = max_consecutive_hits + 5
-        target_score = int(game_score * 1.2)
-        target_gaze = min(100, avg_gaze_score + 10)
-
-        analysis += f"\n🎯 下次训练目标\n"
-        analysis += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        analysis += f"• 目标注意力分数：{target_attention}分以上\n"
-        analysis += f"• 目标最高连击：{target_combo}次\n"
-        analysis += f"• 目标游戏得分：{target_score}分\n"
-        analysis += f"• 目标注视专注度：{target_gaze}分以上\n"
-
-        analysis += f"\n💪 每一次训练都是进步的开始，期待你下次更出色的表现！加油！\n"
-
-        return analysis
 
     def _disconnect_all_signals(self):
         """断开所有信号连接"""
@@ -971,10 +807,12 @@ class TrainingWindow(QWidget):
             record.date_time = QDateTime.currentDateTime()
             record.duration_minutes = self._duration_minutes
             record.game_mode = self._game_mode
-            record.difficulty = settings.difficulty_level()
+            record.difficulty = settings.effective_difficulty_level()
             record.avg_attention_score = avg_attention
             record.total_blinks = self._total_blinks
             record.game_score = self._total_game_score
+            record.avg_gaze_score = self._avg_gaze_score
+            record.avg_gaze_distance = self._avg_gaze_distance
             settings.add_training_record(record)
             print("Training record saved")
         except Exception as e:
@@ -1004,7 +842,7 @@ class TrainingWindow(QWidget):
         self._stop_camera()
 
         settings = GlobalSettings()
-        if settings.ai_enabled() and settings.api_key():
+        if settings.ai_enabled() and settings.api_key() and not settings.local_analysis_enabled():
             print("Starting AI analysis...")
 
             self._show_ai_loading_dialog()

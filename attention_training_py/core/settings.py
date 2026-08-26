@@ -8,6 +8,7 @@ from PySide6.QtCore import QObject, Signal, QSettings, QDateTime
 from PySide6.QtGui import QColor
 
 from .database import Database
+from .paths import app_data_dir, users_dir
 
 
 class DifficultyLevel(Enum):
@@ -15,6 +16,7 @@ class DifficultyLevel(Enum):
     NORMAL = "normal"
     HARD = "hard"
     CUSTOM = "custom"
+    AUTO = "auto"
 
 
 class CustomDifficulty:
@@ -58,6 +60,8 @@ class TrainingRecord:
         self.total_blinks: int = 0
         self.game_score: int = 0
         self.avg_ear: float = 0.0
+        self.avg_gaze_score: int = 0
+        self.avg_gaze_distance: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -68,7 +72,9 @@ class TrainingRecord:
             'avg_attention_score': self.avg_attention_score,
             'total_blinks': self.total_blinks,
             'game_score': self.game_score,
-            'avg_ear': self.avg_ear
+            'avg_ear': self.avg_ear,
+            'avg_gaze_score': self.avg_gaze_score,
+            'avg_gaze_distance': self.avg_gaze_distance
         }
 
     @classmethod
@@ -83,6 +89,8 @@ class TrainingRecord:
         record.total_blinks = data.get('total_blinks', 0)
         record.game_score = data.get('game_score', 0)
         record.avg_ear = data.get('avg_ear', 0.0)
+        record.avg_gaze_score = int(data.get('avg_gaze_score', 0))
+        record.avg_gaze_distance = float(data.get('avg_gaze_distance', 0.0))
         return record
 
 
@@ -104,10 +112,9 @@ class GlobalSettings(QObject):
         super().__init__()
         self._initialized = True
 
-        self.app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.app_dir = app_data_dir()
         self._db = Database()
-        self.users_dir = os.path.join(self.app_dir, "users")
-        os.makedirs(self.users_dir, exist_ok=True)
+        self.users_dir = users_dir()
 
         self._current_user = "默认用户"
         self._settings: Optional[QSettings] = None
@@ -115,6 +122,7 @@ class GlobalSettings(QObject):
 
         # 默认设置
         self._ear_threshold = 0.25
+        self._adaptive_ear = False
         self._sensitivity = 5
         self._night_mode = False
         self._difficulty_level = DifficultyLevel.NORMAL
@@ -124,6 +132,12 @@ class GlobalSettings(QObject):
         self._api_url = "https://api.openai.com/v1/chat/completions"
         self._ai_model = "gpt-3.5-turbo"
         self._ai_enabled = False
+        self._local_analysis_enabled = True
+        self._onnx_face_detection_enabled = False
+        self._onnx_blink_detection_enabled = False
+        self._onnx_head_pose_enabled = False
+        self._onnx_gaze_enabled = False
+        self._onnx_gpu_enabled = False
         self._wallpaper_path = ""
         self._wallpaper_enabled = False
         self._force_standard_bg_in_training = True
@@ -177,7 +191,9 @@ class GlobalSettings(QObject):
                         'avg_attention_score': int(settings.value("avgAttentionScore", 0)),
                         'total_blinks': int(settings.value("totalBlinks", 0)),
                         'game_score': int(settings.value("gameScore", 0)),
-                        'avg_ear': float(settings.value("avgEAR", 0.0))
+                        'avg_ear': float(settings.value("avgEAR", 0.0)),
+                        'avg_gaze_score': int(settings.value("avgGazeScore", 0)),
+                        'avg_gaze_distance': float(settings.value("avgGazeDistance", 0.0))
                     }
                 else:
                     data = {
@@ -188,7 +204,9 @@ class GlobalSettings(QObject):
                         'avg_attention_score': int(settings.value("avg_attention_score", 0)),
                         'total_blinks': int(settings.value("total_blinks", 0)),
                         'game_score': int(settings.value("game_score", 0)),
-                        'avg_ear': float(settings.value("avg_ear", 0.0))
+                        'avg_ear': float(settings.value("avg_ear", 0.0)),
+                        'avg_gaze_score': int(settings.value("avg_gaze_score", 0)),
+                        'avg_gaze_distance': float(settings.value("avg_gaze_distance", 0.0))
                     }
 
                 record = TrainingRecord.from_dict(data)
@@ -238,6 +256,8 @@ class GlobalSettings(QObject):
                 settings.setValue("total_blinks", record.total_blinks)
                 settings.setValue("game_score", record.game_score)
                 settings.setValue("avg_ear", record.avg_ear)
+                settings.setValue("avg_gaze_score", record.avg_gaze_score)
+                settings.setValue("avg_gaze_distance", record.avg_gaze_distance)
         finally:
             settings.endArray()
         settings.sync()
@@ -261,6 +281,7 @@ class GlobalSettings(QObject):
         settings = self._get_user_settings(self._current_user)
 
         self._ear_threshold = float(settings.value("ear_threshold", 0.25))
+        self._adaptive_ear = settings.value("adaptive_ear", False, type=bool)
         self._sensitivity = int(settings.value("sensitivity", 5))
         self._night_mode = settings.value("night_mode", False, type=bool)
 
@@ -278,7 +299,12 @@ class GlobalSettings(QObject):
         self._api_url = settings.value("ai/api_url", "https://api.openai.com/v1/chat/completions")
         self._ai_enabled = settings.value("ai/ai_enabled", False, type=bool)
         self._ai_model = settings.value("ai/ai_model", "gpt-3.5-turbo")
-
+        self._local_analysis_enabled = settings.value("ai/local_analysis_enabled", True, type=bool)
+        self._onnx_face_detection_enabled = settings.value("onnx/face_detection_enabled", False, type=bool)
+        self._onnx_blink_detection_enabled = settings.value("onnx/blink_detection_enabled", False, type=bool)
+        self._onnx_head_pose_enabled = settings.value("onnx/head_pose_enabled", False, type=bool)
+        self._onnx_gaze_enabled = settings.value("onnx/gaze_enabled", False, type=bool)
+        self._onnx_gpu_enabled = settings.value("onnx/gpu_enabled", False, type=bool)
         self._wallpaper_path = settings.value("wallpaper/path", "")
         self._wallpaper_enabled = settings.value("wallpaper/enabled", False, type=bool)
         self._force_standard_bg_in_training = settings.value("wallpaper/force_standard_in_training", True, type=bool)
@@ -293,6 +319,7 @@ class GlobalSettings(QObject):
         settings = self._get_user_settings(self._current_user)
 
         settings.setValue("ear_threshold", self._ear_threshold)
+        settings.setValue("adaptive_ear", self._adaptive_ear)
         settings.setValue("sensitivity", self._sensitivity)
         settings.setValue("night_mode", self._night_mode)
         settings.setValue("difficulty_level", self._difficulty_level.value)
@@ -302,7 +329,12 @@ class GlobalSettings(QObject):
         settings.setValue("ai/api_url", self._api_url)
         settings.setValue("ai/ai_enabled", self._ai_enabled)
         settings.setValue("ai/ai_model", self._ai_model)
-
+        settings.setValue("ai/local_analysis_enabled", self._local_analysis_enabled)
+        settings.setValue("onnx/face_detection_enabled", self._onnx_face_detection_enabled)
+        settings.setValue("onnx/blink_detection_enabled", self._onnx_blink_detection_enabled)
+        settings.setValue("onnx/head_pose_enabled", self._onnx_head_pose_enabled)
+        settings.setValue("onnx/gaze_enabled", self._onnx_gaze_enabled)
+        settings.setValue("onnx/gpu_enabled", self._onnx_gpu_enabled)
         settings.setValue("wallpaper/path", self._wallpaper_path)
         settings.setValue("wallpaper/enabled", self._wallpaper_enabled)
         settings.setValue("wallpaper/force_standard_in_training", self._force_standard_bg_in_training)
@@ -457,6 +489,44 @@ class GlobalSettings(QObject):
             self._save_current_user_settings()
             self.settings_changed.emit()
 
+    def adaptive_ear(self) -> bool:
+        return self._adaptive_ear
+
+    def set_adaptive_ear(self, enabled: bool):
+        if self._adaptive_ear != enabled:
+            self._adaptive_ear = enabled
+            self._save_current_user_settings()
+            self.settings_changed.emit()
+
+    def adaptive_ear_threshold(self) -> float:
+        """根据用户历史训练记录中的平均EAR计算自适应阈值。"""
+        valid_ears = [
+            record.avg_ear
+            for record in self._training_records
+            if 0.05 <= record.avg_ear <= 0.6
+        ]
+        if not valid_ears:
+            return self._ear_threshold
+
+        # 取最近最多10次记录的EAR中位数，作为用户睁眼时的典型EAR
+        recent = valid_ears[:10]
+        recent_sorted = sorted(recent)
+        mid = len(recent_sorted) // 2
+        if len(recent_sorted) % 2 == 0:
+            typical_ear = (recent_sorted[mid - 1] + recent_sorted[mid]) / 2.0
+        else:
+            typical_ear = recent_sorted[mid]
+
+        # 眨眼检测阈值通常取典型EAR的65%，并限制在有效范围内
+        threshold = typical_ear * 0.65
+        return max(0.10, min(0.40, round(threshold, 2)))
+
+    def effective_ear_threshold(self) -> float:
+        """返回当前实际生效的EAR阈值：自适应开启时用历史记录计算值，否则用手动值。"""
+        if self._adaptive_ear:
+            return self.adaptive_ear_threshold()
+        return self._ear_threshold
+
     def sensitivity(self) -> int:
         return self._sensitivity
 
@@ -498,39 +568,69 @@ class GlobalSettings(QObject):
         self._save_current_user_settings()
         self.settings_changed.emit()
 
+    def auto_difficulty_level(self) -> DifficultyLevel:
+        """根据训练历史自动推荐难度等级。
+
+        取最近至多 10 条含有效注意力得分的训练记录：
+        平均注意力 >= 75 推荐困难，<= 50 推荐简单，其余推荐普通；
+        无有效记录时返回普通。
+        """
+        recent = [
+            record for record in self._training_records[:10]
+            if record.avg_attention_score > 0
+        ]
+        if not recent:
+            return DifficultyLevel.NORMAL
+        avg_attention = sum(r.avg_attention_score for r in recent) / len(recent)
+        if avg_attention >= 75:
+            return DifficultyLevel.HARD
+        if avg_attention <= 50:
+            return DifficultyLevel.EASY
+        return DifficultyLevel.NORMAL
+
+    def effective_difficulty_level(self) -> DifficultyLevel:
+        """返回实际生效的难度：自动难度时返回根据训练历史推荐的结果。"""
+        if self._difficulty_level == DifficultyLevel.AUTO:
+            return self.auto_difficulty_level()
+        return self._difficulty_level
+
     def get_spot_interval(self) -> int:
-        if self._difficulty_level == DifficultyLevel.EASY:
+        level = self.effective_difficulty_level()
+        if level == DifficultyLevel.EASY:
             return 2500
-        elif self._difficulty_level == DifficultyLevel.HARD:
+        elif level == DifficultyLevel.HARD:
             return 800
-        elif self._difficulty_level == DifficultyLevel.CUSTOM:
+        elif level == DifficultyLevel.CUSTOM:
             return self._custom_difficulty.spot_speed
         return 1500
 
     def get_spot_size(self) -> int:
-        if self._difficulty_level == DifficultyLevel.EASY:
+        level = self.effective_difficulty_level()
+        if level == DifficultyLevel.EASY:
             return 40
-        elif self._difficulty_level == DifficultyLevel.HARD:
+        elif level == DifficultyLevel.HARD:
             return 20
-        elif self._difficulty_level == DifficultyLevel.CUSTOM:
+        elif level == DifficultyLevel.CUSTOM:
             return self._custom_difficulty.spot_size
         return 30
 
     def get_track_interval(self) -> int:
-        if self._difficulty_level == DifficultyLevel.EASY:
+        level = self.effective_difficulty_level()
+        if level == DifficultyLevel.EASY:
             return 2500
-        elif self._difficulty_level == DifficultyLevel.HARD:
+        elif level == DifficultyLevel.HARD:
             return 700
-        elif self._difficulty_level == DifficultyLevel.CUSTOM:
+        elif level == DifficultyLevel.CUSTOM:
             return self._custom_difficulty.track_speed
         return 1500
 
     def get_track_size(self) -> int:
-        if self._difficulty_level == DifficultyLevel.EASY:
+        level = self.effective_difficulty_level()
+        if level == DifficultyLevel.EASY:
             return 30
-        elif self._difficulty_level == DifficultyLevel.HARD:
+        elif level == DifficultyLevel.HARD:
             return 12
-        elif self._difficulty_level == DifficultyLevel.CUSTOM:
+        elif level == DifficultyLevel.CUSTOM:
             return self._custom_difficulty.track_size
         return 20
 
@@ -566,6 +666,60 @@ class GlobalSettings(QObject):
         if self._ai_model != model:
             self._ai_model = model
             self._save_current_user_settings()
+
+    def local_analysis_enabled(self) -> bool:
+        return self._local_analysis_enabled
+
+    def set_local_analysis_enabled(self, enabled: bool):
+        if self._local_analysis_enabled != enabled:
+            self._local_analysis_enabled = enabled
+            self._save_current_user_settings()
+            self.settings_changed.emit()
+
+    def onnx_face_detection_enabled(self) -> bool:
+        return self._onnx_face_detection_enabled
+
+    def set_onnx_face_detection_enabled(self, enabled: bool):
+        if self._onnx_face_detection_enabled != enabled:
+            self._onnx_face_detection_enabled = enabled
+            self._save_current_user_settings()
+            self.settings_changed.emit()
+
+    def onnx_blink_detection_enabled(self) -> bool:
+        return self._onnx_blink_detection_enabled
+
+    def set_onnx_blink_detection_enabled(self, enabled: bool):
+        if self._onnx_blink_detection_enabled != enabled:
+            self._onnx_blink_detection_enabled = enabled
+            self._save_current_user_settings()
+            self.settings_changed.emit()
+
+    def onnx_head_pose_enabled(self) -> bool:
+        return self._onnx_head_pose_enabled
+
+    def set_onnx_head_pose_enabled(self, enabled: bool):
+        if self._onnx_head_pose_enabled != enabled:
+            self._onnx_head_pose_enabled = enabled
+            self._save_current_user_settings()
+            self.settings_changed.emit()
+
+    def onnx_gaze_enabled(self) -> bool:
+        return self._onnx_gaze_enabled
+
+    def set_onnx_gaze_enabled(self, enabled: bool):
+        if self._onnx_gaze_enabled != enabled:
+            self._onnx_gaze_enabled = enabled
+            self._save_current_user_settings()
+            self.settings_changed.emit()
+
+    def onnx_gpu_enabled(self) -> bool:
+        return self._onnx_gpu_enabled
+
+    def set_onnx_gpu_enabled(self, enabled: bool):
+        if self._onnx_gpu_enabled != enabled:
+            self._onnx_gpu_enabled = enabled
+            self._save_current_user_settings()
+            self.settings_changed.emit()
 
     def training_records(self) -> List[TrainingRecord]:
         return self._training_records.copy()

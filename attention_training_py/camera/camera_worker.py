@@ -1,7 +1,9 @@
 # camera/camera_worker.py
 import cv2
 import math
+import time
 import numpy as np
+import threading
 import mediapipe as mp
 from PySide6.QtCore import QObject, Signal, QTimer, QMetaObject, Qt
 from PySide6.QtGui import QImage
@@ -46,6 +48,7 @@ class CameraWorker(QObject):
 
         # 眨眼检测参数
         self.EAR_THRESHOLD = 0.22
+        self._adaptive_ear_enabled = False
         self.EYE_AR_CONSEC_FRAMES = 2
         self._eye_counter = 0
         self._blink_counter = 0
@@ -81,11 +84,90 @@ class CameraWorker(QObject):
         # 允许的最大归一化虹膜偏移，避免极端噪声直接打到屏幕边缘
         self._gaze_max_offset = 0.5
 
+        # 信号发送节流（限制GUI线程负载，防止事件队列堆积）
+        self.FRAME_EMIT_INTERVAL = 1.0 / 12.0    # 预览帧上限 ~12 FPS
+        self.EYE_DATA_EMIT_INTERVAL = 1.0 / 10.0 # 数据更新上限 ~10 Hz
+        self._last_frame_emit = -1.0
+        self._last_eye_emit = -1.0
+
+        # ONNX 视觉增强（阶段1+2：YuNet 人脸检测 + OCEC 眨眼检测）
+        self._onnx_engine = None
+        self._onnx_face_enabled = False
+        self._onnx_blink_enabled = False
+        self._onnx_face_ok = False
+        self._onnx_blink_ok = False
+        self._onnx_eye_state = "OPEN"
+        self._onnx_open_frames = 0
+        self._onnx_closed_frames = 0
+        # 自适应开眼概率基线：跟踪近期开眼概率，避免固定滞回阈值与模型实际输出
+        # 标定不一致时状态机卡死在 CLOSING 导致眨眼漏报；看门狗避免长时间闭眼卡死
+        self._onnx_open_base = 0.9
+        self._onnx_max_closed_frames = 20
+        # OCEC 失效健康检查：模型输出退化时用 EAR 并行计数作为对照
+        self._onnx_ear_blinks = 0
+        self._onnx_warned = set()
+        self._onnx_head_pose_enabled = False
+        self._onnx_gaze_enabled = False
+        self._onnx_head_pose_ok = False
+        self._onnx_gaze_ok = False
+        self._onnx_head_pose = None
+        self._onnx_gaze = None
+        self._onnx_last_face = None
+        self._onnx_prob_open = 0.5
+        self._onnx_face_infer_errors = 0
+        # ONNX 后台预热：模型加载放到独立线程，避免阻塞摄像头初始化与帧循环
+        self._onnx_warmup_thread = None
+        self._onnx_warmup_started = False
+        self._onnx_lock = threading.Lock()
+
         print("CameraWorker initialized")
+
+    def set_ear_threshold(self, value: float):
+        """设置EAR闭眼检测阈值"""
+        self.EAR_THRESHOLD = max(0.1, min(0.4, float(value)))
+
+    def set_adaptive_ear(self, enabled: bool):
+        """开启/关闭自适应EAR：开启后阈值根据历史记录与实时数据动态调整"""
+        self._adaptive_ear_enabled = bool(enabled)
 
     def start_capture(self):
         """启动摄像头"""
         print("CameraWorker.start_capture called")
+
+        # 读取 ONNX 视觉设置（模型缺失时自动回退 MediaPipe）
+        with self._onnx_lock:
+            self._onnx_engine = None
+            self._onnx_face_ok = False
+            self._onnx_blink_ok = False
+            self._onnx_head_pose_ok = False
+            self._onnx_gaze_ok = False
+            self._onnx_last_face = None
+            self._onnx_prob_open = 0.5
+            self._onnx_open_base = 0.9
+            self._onnx_eye_state = "OPEN"
+            self._onnx_open_frames = 0
+            self._onnx_closed_frames = 0
+            self._last_blink_time = 0
+            self._onnx_ear_blinks = 0
+            self._onnx_face_infer_errors = 0
+            self._onnx_warmup_started = False
+        self._last_frame_emit = -1.0
+        self._last_eye_emit = -1.0
+        try:
+            from core.settings import GlobalSettings
+            self._onnx_face_enabled = GlobalSettings().onnx_face_detection_enabled()
+            self._onnx_blink_enabled = GlobalSettings().onnx_blink_detection_enabled()
+            self._onnx_head_pose_enabled = GlobalSettings().onnx_head_pose_enabled()
+            self._onnx_gaze_enabled = GlobalSettings().onnx_gaze_enabled()
+        except Exception:
+            self._onnx_face_enabled = False
+            self._onnx_blink_enabled = False
+            self._onnx_head_pose_enabled = False
+            self._onnx_gaze_enabled = False
+        print(f"ONNX vision: face={self._onnx_face_enabled} blink={self._onnx_blink_enabled} head_pose={self._onnx_head_pose_enabled} gaze={self._onnx_gaze_enabled}")
+
+        # 后台预热 ONNX 引擎，摄像头立即开始出帧，模型就绪后自动切换
+        self._start_onnx_warmup()
 
         if self._running:
             print("Camera already running")
@@ -165,16 +247,163 @@ class CameraWorker(QObject):
             self._gaze_score = gaze_score
             self._gaze_distance = gaze_distance
 
-            self.eye_data_updated.emit(ear, blink_count, attention, gaze_score, gaze_distance)
+            now = time.monotonic()
+            if now - self._last_eye_emit >= self.EYE_DATA_EMIT_INTERVAL:
+                self._last_eye_emit = now
+                self.eye_data_updated.emit(ear, blink_count, attention, gaze_score, gaze_distance)
 
-            qimage = self._cv2_to_qimage(processed_frame)
-            self.frame_ready.emit(qimage)
+            if now - self._last_frame_emit >= self.FRAME_EMIT_INTERVAL:
+                self._last_frame_emit = now
+                qimage = self._cv2_to_qimage(processed_frame)
+                self.frame_ready.emit(qimage)
 
         except Exception as e:
             print(f"Frame update error: {e}")
 
+    def _warn_once(self, key: str, message: str):
+        if key not in self._onnx_warned:
+            self._onnx_warned.add(key)
+            print(f"CameraWorker: {message}")
+
+    def _start_onnx_warmup(self):
+        """在后台线程初始化 ONNX 视觉引擎，不阻塞摄像头打开与帧循环。"""
+        if not (self._onnx_face_enabled or self._onnx_blink_enabled
+                or self._onnx_head_pose_enabled or self._onnx_gaze_enabled):
+            return
+        with self._onnx_lock:
+            if self._onnx_warmup_started:
+                return
+            self._onnx_warmup_started = True
+            thread = threading.Thread(
+                target=self._ensure_onnx, name="onnx-vision-warmup", daemon=True
+            )
+        self._onnx_warmup_thread = thread
+        thread.start()
+        print("CameraWorker: ONNX 视觉引擎后台预热已启动")
+
+    def _ensure_onnx(self):
+        """初始化 ONNX 视觉引擎并检查模型可用性（后台线程执行，仅一次）。"""
+        with self._onnx_lock:
+            if self._onnx_engine is not None:
+                return
+            try:
+                from camera.onnx_vision import ONNXVisionEngine
+                engine = ONNXVisionEngine.instance()
+                face_ok = False
+                blink_ok = False
+                head_pose_ok = False
+                gaze_ok = False
+                if self._onnx_face_enabled:
+                    face_ok = engine.face_detection_available()
+                    if not face_ok:
+                        self._warn_once("face", "ONNX 人脸检测模型不可用，回退 MediaPipe")
+                if self._onnx_blink_enabled:
+                    blink_ok = engine.blink_detection_available()
+                    if not blink_ok:
+                        self._warn_once("blink", "ONNX 眨眼检测模型不可用，回退 EAR 阈值")
+                if self._onnx_head_pose_enabled:
+                    head_pose_ok = engine.head_pose_detection_available()
+                    if not head_pose_ok:
+                        self._warn_once("head_pose", "ONNX 头部姿态模型不可用，跳过")
+                if self._onnx_gaze_enabled:
+                    gaze_ok = engine.gaze_detection_available()
+                    if not gaze_ok:
+                        self._warn_once("gaze", "ONNX 视线模型不可用，回退虹膜注视")
+                self._onnx_engine = engine
+                self._onnx_face_ok = face_ok
+                self._onnx_blink_ok = blink_ok
+                self._onnx_head_pose_ok = head_pose_ok
+                self._onnx_gaze_ok = gaze_ok
+            except Exception as exc:
+                self._onnx_engine = None
+                self._onnx_face_ok = False
+                self._onnx_blink_ok = False
+                self._onnx_head_pose_ok = False
+                self._onnx_gaze_ok = False
+                self._warn_once("init", f"ONNX 视觉引擎初始化失败: {exc}")
+            print(f"ONNX vision engine ready: face={self._onnx_face_ok} "
+                  f"blink={self._onnx_blink_ok} head_pose={self._onnx_head_pose_ok} "
+                  f"gaze={self._onnx_gaze_ok}")
+
+    def _detect_face_onnx(self, frame):
+        if not self._onnx_face_ok or self._onnx_engine is None:
+            return None
+        try:
+            result = self._onnx_engine.detect_face(frame)
+            self._onnx_face_infer_errors = 0
+            return result
+        except Exception as exc:
+            self._onnx_face_infer_errors += 1
+            self._warn_once("face_infer", f"ONNX 人脸检测失败: {exc}")
+            if self._onnx_face_infer_errors >= 5:
+                self._onnx_face_ok = False
+                self._warn_once("face_infer_disable", "ONNX 人脸检测连续失败，回退 MediaPipe")
+            return None
+
+    def _classify_eyes_onnx(self, frame, left_eye_pts, right_eye_pts) -> float:
+        """用 OCEC 分类双眼，返回平均开眼概率。"""
+        if not self._onnx_blink_ok or self._onnx_engine is None:
+            return 0.5
+        try:
+            left_cx = sum(pt[0] for pt in left_eye_pts) / len(left_eye_pts)
+            left_cy = sum(pt[1] for pt in left_eye_pts) / len(left_eye_pts)
+            right_cx = sum(pt[0] for pt in right_eye_pts) / len(right_eye_pts)
+            right_cy = sum(pt[1] for pt in right_eye_pts) / len(right_eye_pts)
+            ref = math.hypot(right_cx - left_cx, right_cy - left_cy)
+            left_crop = self._onnx_engine.crop_eye(frame, (left_cx, left_cy), ref)
+            right_crop = self._onnx_engine.crop_eye(frame, (right_cx, right_cy), ref)
+            p_left, p_right = self._onnx_engine.classify_eyes(left_crop, right_crop)
+            return (p_left + p_right) / 2.0
+        except Exception as exc:
+            self._warn_once("blink_infer", f"ONNX 眨眼检测失败: {exc}")
+            return 0.5
+
+    def _get_face_crop(self, frame, landmarks, w, h, onnx_face=None):
+        """Face crop from YuNet box or MediaPipe landmark bbox, expanded 20%."""
+        if onnx_face is not None:
+            bx, by, bw, bh = [float(v) for v in onnx_face["box"]]
+        else:
+            xs = [lm.x * w for lm in landmarks]
+            ys = [lm.y * h for lm in landmarks]
+            bx, by = min(xs), min(ys)
+            bw, bh = max(xs) - bx, max(ys) - by
+        ex = int(bh * 0.2)
+        ey = int(bw * 0.2)
+        x0 = max(0, int(bx) - ex)
+        y0 = max(0, int(by) - ey)
+        x1 = min(w, int(bx + bw) + ex)
+        y1 = min(h, int(by + bh) + ey)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return frame[y0:y1, x0:x1]
+
+    def _estimate_head_pose_onnx(self, face_crop):
+        if not self._onnx_head_pose_ok or self._onnx_engine is None or face_crop is None:
+            return None
+        try:
+            return self._onnx_engine.estimate_head_pose(face_crop)
+        except Exception as exc:
+            self._warn_once("head_pose_infer", f"ONNX \u5934\u90e8\u59ff\u6001\u63a8\u7406\u5931\u8d25: {exc}")
+            return None
+
+    def _estimate_gaze_onnx(self, face_crop):
+        if not self._onnx_gaze_ok or self._onnx_engine is None or face_crop is None:
+            return None
+        try:
+            return self._onnx_engine.estimate_gaze(face_crop)
+        except Exception as exc:
+            self._warn_once("gaze_infer", f"ONNX \u89c6\u7ebf\u63a8\u7406\u5931\u8d25: {exc}")
+            return None
+
     def _process_frame(self, frame):
         """处理单帧"""
+        # 未启动后台预热时（如验证脚本直接调用管线）同步初始化；
+        # 生产环境由 start_capture 启动的后台线程完成，帧循环不会被阻塞。
+        if not self._onnx_warmup_started and (
+                self._onnx_face_enabled or self._onnx_blink_enabled
+                or self._onnx_head_pose_enabled or self._onnx_gaze_enabled):
+            self._ensure_onnx()
+
         display = frame.copy()
         self._total_frames += 1
 
@@ -187,13 +416,47 @@ class CameraWorker(QObject):
         gaze_score = 100
         gaze_distance = 1.0
 
-        if not results.multi_face_landmarks:
+        mp_face = bool(results.multi_face_landmarks)
+        onnx_face = self._onnx_last_face
+        if self._onnx_face_enabled and self._onnx_face_ok:
+            # YuNet 每4帧检测一次，中间帧复用缓存的人脸框
+            if self._total_frames % 4 == 1:
+                self._onnx_last_face = self._detect_face_onnx(frame)
+                onnx_face = self._onnx_last_face
+            face_present = onnx_face is not None
+        else:
+            # ONNX 未就绪/不可用时回退 MediaPipe，避免训练期间误报“未检测到人脸”
+            face_present = mp_face
+
+        if not face_present:
             cv2.putText(display, "No face detected", (10, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             return display, ear, blink_count, attention, gaze_score, gaze_distance
 
+        if onnx_face is not None:
+            bx, by, bw, bh = [int(v) for v in onnx_face["box"]]
+            cv2.rectangle(display, (bx, by), (bx + bw, by + bh), (255, 165, 0), 2)
+            cv2.putText(display, f"YuNet {onnx_face['score']:.2f}", (bx, by - 6),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 165, 0), 2)
+
+        if not mp_face:
+            cv2.putText(display, "Face detected (ONNX)", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            return display, ear, blink_count, attention, gaze_score, gaze_distance
+
         landmarks = results.multi_face_landmarks[0].landmark
         h, w, _ = frame.shape
+
+        # Stage 3+4: 头部姿态/视线各每6帧跑一次并错开不同帧，中间帧复用缓存结果
+        if self._onnx_head_pose_enabled or self._onnx_gaze_enabled:
+            if self._total_frames % 6 == 1:
+                if self._onnx_head_pose_enabled and self._onnx_head_pose_ok:
+                    face_crop = self._get_face_crop(frame, landmarks, w, h, onnx_face)
+                    self._onnx_head_pose = self._estimate_head_pose_onnx(face_crop)
+            elif self._total_frames % 6 == 4:
+                if self._onnx_gaze_enabled and self._onnx_gaze_ok:
+                    face_crop = self._get_face_crop(frame, landmarks, w, h, onnx_face)
+                    self._onnx_gaze = self._estimate_gaze_onnx(face_crop)
 
         # 获取眼部关键点（像素坐标）
         left_eye_pts = self._get_eye_points(landmarks, self.LEFT_EYE_INDICES, w, h, normalize=False)
@@ -219,69 +482,97 @@ class CameraWorker(QObject):
             cv2.polylines(display, [right_eye_hull], True, (0, 255, 0), 1)
 
             # ========== 注视检测 ==========
-            gaze_point = self._calculate_gaze_point(
-                landmarks, left_eye_pts, right_eye_pts,
-                left_iris_pts, right_iris_pts,
-                left_eye_corners, right_eye_corners,
-                w, h
-            )
-
-            if gaze_point:
-                gaze_x, gaze_y = gaze_point
-                self._last_gaze_point = (gaze_x, gaze_y)
-
-                # 绘制注视点
-                cv2.circle(display, (int(gaze_x), int(gaze_y)), 10, (0, 0, 255), 2)
-                cv2.circle(display, (int(gaze_x), int(gaze_y)), 4, (0, 0, 255), -1)
-
-                # 绘制从屏幕中心到注视点的连线
-                center_x, center_y = w // 2, h // 2
-                cv2.line(display, (center_x, center_y), (int(gaze_x), int(gaze_y)), (255, 0, 255), 1)
-
-                # 绘制屏幕中心参考点
-                cv2.circle(display, (center_x, center_y), 6, (0, 255, 255), 1)
-
-                # 计算注视偏离距离
-                dx = (gaze_x - center_x) / (w / 2)
-                dy = (gaze_y - center_y) / (h / 2)
-                gaze_distance = math.sqrt(dx * dx + dy * dy)
+            onnx_gaze_active = self._onnx_gaze_enabled and self._onnx_gaze_ok and self._onnx_gaze is not None
+            if onnx_gaze_active:
+                g_yaw, g_pitch = self._onnx_gaze
+                gaze_distance = min(1.0, math.hypot(math.tan(g_yaw), math.tan(g_pitch)) / 0.75)
                 self._gaze_distance = gaze_distance
-
-                # 更新注视历史
                 self._gaze_history.append(gaze_distance)
                 if len(self._gaze_history) > self._gaze_history_size:
                     self._gaze_history.pop(0)
-
-                # 计算注视专注度分数
                 gaze_score = self._calculate_gaze_score()
                 self._gaze_score = gaze_score
-
-                # 显示注视信息
-                cv2.putText(display, f"Gaze Dist: {gaze_distance:.3f}", (10, 180),
+                cv2.putText(display, f"Gaze Yaw: {math.degrees(g_yaw):.0f} Pitch: {math.degrees(g_pitch):.0f}", (10, 180),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                 cv2.putText(display, f"Gaze Score: {gaze_score}", (10, 210),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                cv2.putText(display, "Gaze(ONNX)", (w - 200, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            else:
+                gaze_point = self._calculate_gaze_point(
+                    landmarks, left_eye_pts, right_eye_pts,
+                    left_iris_pts, right_iris_pts,
+                    left_eye_corners, right_eye_corners,
+                    w, h
+                )
 
-                # 根据注视状态显示提示
-                if gaze_distance < 0.15:
-                    cv2.putText(display, "Looking at screen", (w - 200, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                elif gaze_distance < 0.3:
-                    cv2.putText(display, "Looking away slightly", (w - 230, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                else:
-                    cv2.putText(display, "Looking away!", (w - 180, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                if gaze_point:
+                    gaze_x, gaze_y = gaze_point
+                    self._last_gaze_point = (gaze_x, gaze_y)
+                    cv2.circle(display, (int(gaze_x), int(gaze_y)), 10, (0, 0, 255), 2)
+                    cv2.circle(display, (int(gaze_x), int(gaze_y)), 4, (0, 0, 255), -1)
+                    center_x, center_y = w // 2, h // 2
+                    cv2.line(display, (center_x, center_y), (int(gaze_x), int(gaze_y)), (255, 0, 255), 1)
+                    cv2.circle(display, (center_x, center_y), 6, (0, 255, 255), 1)
+                    dx = (gaze_x - center_x) / (w / 2)
+                    dy = (gaze_y - center_y) / (h / 2)
+                    gaze_distance = math.sqrt(dx * dx + dy * dy)
+                    self._gaze_distance = gaze_distance
+                    self._gaze_history.append(gaze_distance)
+                    if len(self._gaze_history) > self._gaze_history_size:
+                        self._gaze_history.pop(0)
+                    gaze_score = self._calculate_gaze_score()
+                    self._gaze_score = gaze_score
+                    cv2.putText(display, f"Gaze Dist: {gaze_distance:.3f}", (10, 180),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                    cv2.putText(display, f"Gaze Score: {gaze_score}", (10, 210),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                    if gaze_distance < 0.15:
+                        cv2.putText(display, "Looking at screen", (w - 200, 30),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    elif gaze_distance < 0.3:
+                        cv2.putText(display, "Looking away slightly", (w - 230, 30),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    else:
+                        cv2.putText(display, "Looking away!", (w - 180, 30),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-            # 眨眼检测
-            blink_detected = self._detect_blink(ear)
+            if self._onnx_blink_enabled and self._onnx_blink_ok:
+                # OCEC 每帧分类一次，避免采样间隔漏掉快速眨眼
+                self._onnx_prob_open = self._classify_eyes_onnx(frame, left_eye_pts, right_eye_pts)
+                prob_open = self._onnx_prob_open
+                ear_for_score = 0.12 + 0.22 * prob_open
+                blink_detected = self._detect_blink_prob(prob_open)
+                # 健康检查：若 OCEC 一直计不到眨眼而 EAR 能正常计数
+                # （当前画面下模型输出退化，如裁剪/光照问题），
+                # 自动回退 EAR，避免眨眼数恒为 0
+                if self._detect_blink(ear):
+                    self._onnx_ear_blinks += 1
+                    if self._blink_counter == 0 and self._onnx_ear_blinks >= 3:
+                        self._onnx_blink_ok = False
+                        self._onnx_ear_blinks = 0
+                        self._warn_once(
+                            "blink_unusable",
+                            "OCEC 眨眼模型输出不可用，回退 EAR 阈值眨眼检测",
+                        )
+                cv2.putText(display, f"OCEC: {prob_open:.2f}", (10, 240),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 2)
+            else:
+                ear_for_score = ear
+                blink_detected = self._detect_blink(ear)
             if blink_detected:
                 self._blink_counter += 1
                 cv2.putText(display, "Blink Detected!", (10, 90),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
             # 计算注意力分数
-            attention = self._calculate_attention_score(ear, gaze_score)
+            attention = self._calculate_attention_score(ear_for_score, gaze_score)
+            if self._onnx_head_pose_enabled and self._onnx_head_pose_ok and self._onnx_head_pose is not None:
+                hp_pitch, hp_yaw, hp_roll = self._onnx_head_pose
+                penalty = min(35, int(abs(hp_yaw) * 0.6 + abs(hp_pitch) * 0.4))
+                attention = max(0, attention - penalty)
+                cv2.putText(display, f"HP: yaw {hp_yaw:.0f} pitch {hp_pitch:.0f} roll {hp_roll:.0f}", (10, 260),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
             # 显示信息
             cv2.putText(display, f"EAR: {ear:.3f}", (10, 30),
@@ -459,7 +750,8 @@ class CameraWorker(QObject):
         if len(self._ear_history) > self._history_size:
             self._ear_history.pop(0)
 
-        if len(self._ear_history) < 10:
+        # 手动模式下固定使用设定的阈值；自适应模式下根据实时历史动态调节
+        if not self._adaptive_ear_enabled or len(self._ear_history) < 10:
             threshold = self.EAR_THRESHOLD
         else:
             sorted_history = sorted(self._ear_history)
@@ -481,6 +773,52 @@ class CameraWorker(QObject):
                     return True
             self._eye_counter = 0
             return False
+
+    def _detect_blink_prob(self, prob_open: float) -> bool:
+        """基于 OCEC 开眼概率的自适应眨眼状态机。
+
+        关闭/恢复阈值跟随近期开眼概率基线自适应：当模型输出标定偏低（开眼概率
+        落在固定 0.45~0.55 死区内）时，旧状态机会卡死在 CLOSING，之后所有眨眼
+        都会漏报；看门狗则保证长时间闭眼/遮挡后转入 CLOSED_LONG，重新睁眼时
+        复位但不计数，也不阻塞后续检测。
+        """
+        if self._onnx_eye_state == "OPEN":
+            self._onnx_open_frames += 1
+            # 仅用开眼时段的概率更新基线，眨眼时的低概率不会污染基线
+            self._onnx_open_base += 0.08 * (prob_open - self._onnx_open_base)
+            close_th = max(0.28, min(0.50, self._onnx_open_base * 0.6))
+            if prob_open < close_th:
+                self._onnx_eye_state = "CLOSING"
+                self._onnx_closed_frames = 1
+        elif self._onnx_eye_state == "CLOSING":
+            self._onnx_closed_frames += 1
+            if self._onnx_closed_frames >= self._onnx_max_closed_frames:
+                # 长时间闭眼/遮挡：转入 CLOSED_LONG，睁眼时复位但不计数
+                self._onnx_eye_state = "CLOSED_LONG"
+                self._onnx_open_frames = 0
+                self._onnx_closed_frames = 0
+            else:
+                reopen_th = max(0.38, min(0.60, self._onnx_open_base * 0.75))
+                if prob_open > reopen_th:
+                    counted = False
+                    if self._onnx_closed_frames >= 2:
+                        current_frame = self._total_frames
+                        if current_frame - self._last_blink_time >= self._min_blink_interval:
+                            self._last_blink_time = current_frame
+                            counted = True
+                    self._onnx_eye_state = "OPEN"
+                    self._onnx_open_frames = 0
+                    self._onnx_closed_frames = 0
+                    return counted
+        elif self._onnx_eye_state == "CLOSED_LONG":
+            # 长时间闭眼/标定漂移期间仍缓慢更新基线，避免恢复阈值偏高而卡死
+            self._onnx_open_base += 0.08 * (prob_open - self._onnx_open_base)
+            reopen_th = max(0.38, min(0.60, self._onnx_open_base * 0.75))
+            if prob_open > reopen_th:
+                self._onnx_eye_state = "OPEN"
+                self._onnx_open_frames = 0
+                self._onnx_closed_frames = 0
+        return False
 
     def _calculate_attention_score(self, ear, gaze_score):
         """计算注意力分数"""

@@ -23,6 +23,8 @@ class TrainingRecordDialog(QDialog):
         self._attention_series = None
         self._score_series = None
         self._blink_series = None
+        self._gaze_score_series = None
+        self._gaze_distance_series = None
         self._student_selector = None
         self._selected_student_username = ""
         self._table = None  # 初始化
@@ -31,6 +33,8 @@ class TrainingRecordDialog(QDialog):
         self._attention_chart_view = None
         self._score_chart_view = None
         self._blink_chart_view = None
+        self._gaze_score_chart_view = None
+        self._gaze_distance_chart_view = None
         self._improvement_label = None
         self._trend_label = None
 
@@ -84,10 +88,11 @@ class TrainingRecordDialog(QDialog):
         record_layout.setContentsMargins(5, 5, 5, 5)
 
         self._table = QTableWidget()  # 创建 _table
-        self._table.setColumnCount(7)
+        self._table.setColumnCount(9)
         self._table.setHorizontalHeaderLabels([
             "训练时间", "时长", "游戏模式", "难度",
-            "平均注意力", "眨眼次数", "游戏得分"
+            "平均注意力", "眨眼次数", "游戏得分",
+            "注视专注度平均值", "注视偏移距离平均值"
         ])
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -176,6 +181,16 @@ class TrainingRecordDialog(QDialog):
         self._blink_series.setColor(QColor(255, 152, 0))
         self._blink_series.setPointsVisible(True)
 
+        self._gaze_score_series = QLineSeries()
+        self._gaze_score_series.setName("注视专注度平均值")
+        self._gaze_score_series.setColor(QColor(156, 39, 176))
+        self._gaze_score_series.setPointsVisible(True)
+
+        self._gaze_distance_series = QLineSeries()
+        self._gaze_distance_series.setName("注视偏移距离平均值")
+        self._gaze_distance_series.setColor(QColor(0, 150, 136))
+        self._gaze_distance_series.setPointsVisible(True)
+
         # 注意力图表
         attention_chart = QChart()
         attention_chart.addSeries(self._attention_series)
@@ -212,11 +227,37 @@ class TrainingRecordDialog(QDialog):
         self._blink_chart_view.setMinimumHeight(250)
         scroll_layout.addWidget(self._blink_chart_view)
 
+        # 注视专注度平均值图表
+        gaze_score_chart = QChart()
+        gaze_score_chart.addSeries(self._gaze_score_series)
+        gaze_score_chart.setTitle("注视专注度平均值趋势")
+        gaze_score_chart.setAnimationOptions(QChart.NoAnimation)
+        gaze_score_chart.setBackgroundVisible(False)
+
+        self._gaze_score_chart_view = QChartView(gaze_score_chart)
+        self._gaze_score_chart_view.setRenderHint(QPainter.Antialiasing)
+        self._gaze_score_chart_view.setMinimumHeight(250)
+        scroll_layout.addWidget(self._gaze_score_chart_view)
+
+        # 注视偏移距离平均值图表
+        gaze_distance_chart = QChart()
+        gaze_distance_chart.addSeries(self._gaze_distance_series)
+        gaze_distance_chart.setTitle("注视偏移距离平均值趋势")
+        gaze_distance_chart.setAnimationOptions(QChart.NoAnimation)
+        gaze_distance_chart.setBackgroundVisible(False)
+
+        self._gaze_distance_chart_view = QChartView(gaze_distance_chart)
+        self._gaze_distance_chart_view.setRenderHint(QPainter.Antialiasing)
+        self._gaze_distance_chart_view.setMinimumHeight(250)
+        scroll_layout.addWidget(self._gaze_distance_chart_view)
+
         info_label = QLabel(
             "💡 提示：\n"
             "• 图表从左到右显示最早到最近的训练记录\n"
             "• 注意力分数越高表示专注度越好\n"
-            "• 眨眼次数越少通常表示更专注"
+            "• 眨眼次数越少通常表示更专注\n"
+            "• 注视专注度平均值越高表示视线越集中\n"
+            "• 注视偏移距离平均值越小表示视线越贴近屏幕中心"
         )
         info_label.setWordWrap(True)
         info_label.setStyleSheet("font-size: 11px; color: #888888; padding: 10px; background-color: rgba(0,0,0,0.05); border-radius: 8px;")
@@ -280,7 +321,7 @@ class TrainingRecordDialog(QDialog):
 
         if not records:
             self._table.setRowCount(1)
-            self._table.setSpan(0, 0, 1, 7)
+            self._table.setSpan(0, 0, 1, self._table.columnCount())
             empty_item = QTableWidgetItem("暂无训练记录")
             empty_item.setTextAlignment(Qt.AlignCenter)
             self._table.setItem(0, 0, empty_item)
@@ -315,6 +356,24 @@ class TrainingRecordDialog(QDialog):
             self._table.setItem(i, 5, QTableWidgetItem(str(record.total_blinks)))
             self._table.setItem(i, 6, QTableWidgetItem(str(record.game_score)))
 
+            gaze_score_item = QTableWidgetItem(str(record.avg_gaze_score))
+            if record.avg_gaze_score >= 70:
+                gaze_score_item.setForeground(QColor(76, 175, 80))
+            elif record.avg_gaze_score >= 40:
+                gaze_score_item.setForeground(QColor(255, 152, 0))
+            else:
+                gaze_score_item.setForeground(QColor(244, 67, 54))
+            self._table.setItem(i, 7, gaze_score_item)
+
+            gaze_dist_item = QTableWidgetItem(f"{record.avg_gaze_distance:.3f}")
+            if record.avg_gaze_distance < 0.15:
+                gaze_dist_item.setForeground(QColor(76, 175, 80))
+            elif record.avg_gaze_distance < 0.3:
+                gaze_dist_item.setForeground(QColor(255, 152, 0))
+            else:
+                gaze_dist_item.setForeground(QColor(244, 67, 54))
+            self._table.setItem(i, 8, gaze_dist_item)
+
     def _update_charts(self, records: list):
         if not self._attention_series:
             return
@@ -337,6 +396,8 @@ class TrainingRecordDialog(QDialog):
         self._attention_series.clear()
         self._score_series.clear()
         self._blink_series.clear()
+        self._gaze_score_series.clear()
+        self._gaze_distance_series.clear()
 
         if not records:
             return
@@ -349,6 +410,8 @@ class TrainingRecordDialog(QDialog):
             self._attention_series.append(x, record.avg_attention_score)
             self._score_series.append(x, record.game_score)
             self._blink_series.append(x, record.total_blinks)
+            self._gaze_score_series.append(x, record.avg_gaze_score)
+            self._gaze_distance_series.append(x, record.avg_gaze_distance)
 
         self._setup_chart_axes(len(chart_records))
 
@@ -359,7 +422,9 @@ class TrainingRecordDialog(QDialog):
         charts = [
             (self._attention_chart_view, self._attention_series, "注意力分数", 0, 100),
             (self._score_chart_view, self._score_series, "游戏得分", 0, 1500),
-            (self._blink_chart_view, self._blink_series, "眨眼次数", 0, 30)
+            (self._blink_chart_view, self._blink_series, "眨眼次数", 0, 30),
+            (self._gaze_score_chart_view, self._gaze_score_series, "注视专注度平均值", 0, 100),
+            (self._gaze_distance_chart_view, self._gaze_distance_series, "注视偏移距离平均值", 0, 1.0)
         ]
 
         for chart_view, series, title, min_val, max_val in charts:

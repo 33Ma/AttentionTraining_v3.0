@@ -60,16 +60,39 @@ class SettingDialog(QDialog):
 
         # EAR阈值
         ear_group = QGroupBox("闭眼检测阈值 (EAR)")
-        ear_layout = QHBoxLayout(ear_group)
+        ear_layout = QVBoxLayout(ear_group)
+
+        ear_mode_row = QHBoxLayout()
+        self._manual_ear_radio = QRadioButton("手动调节")
+        self._adaptive_ear_radio = QRadioButton("自适应EAR")
+        self._manual_ear_radio.setChecked(True)
+        ear_mode_row.addWidget(self._manual_ear_radio)
+        ear_mode_row.addWidget(self._adaptive_ear_radio)
+        ear_mode_row.addStretch()
+        ear_layout.addLayout(ear_mode_row)
+
+        ear_threshold_row = QHBoxLayout()
         ear_label = QLabel("阈值:")
         self._ear_spin = QDoubleSpinBox()
         self._ear_spin.setRange(0.1, 0.4)
         self._ear_spin.setSingleStep(0.01)
         self._ear_spin.setDecimals(2)
-        ear_layout.addWidget(ear_label)
-        ear_layout.addWidget(self._ear_spin)
-        ear_layout.addStretch()
+        ear_threshold_row.addWidget(ear_label)
+        ear_threshold_row.addWidget(self._ear_spin)
+        ear_threshold_row.addStretch()
+        ear_layout.addLayout(ear_threshold_row)
+
+        self._ear_hint_label = QLabel(
+            "💡 关闭自适应EAR时可手动调节阈值；开启后系统会根据历史训练记录自动调节阈值"
+        )
+        self._ear_hint_label.setWordWrap(True)
+        self._ear_hint_label.setStyleSheet("font-size: 11px; color: #888888; padding-left: 25px;")
+        ear_layout.addWidget(self._ear_hint_label)
+
         main_layout.addWidget(ear_group)
+
+        # 自适应EAR开启时禁用手动阈值输入
+        self._adaptive_ear_radio.toggled.connect(self._on_adaptive_ear_toggled)
 
         # 灵敏度
         sens_group = QGroupBox("眨眼灵敏度")
@@ -98,6 +121,8 @@ class SettingDialog(QDialog):
         ai_layout = QVBoxLayout(ai_group)
 
         self._ai_enable_check = QCheckBox("启用AI智能分析")
+        self._local_analysis_check = QCheckBox("启动本地模型分析")
+        self._local_analysis_check.setToolTip("使用本地 ONNX 模型分析训练数据，无需网络与 API 密钥")
 
         api_key_layout = QHBoxLayout()
         api_key_layout.addWidget(QLabel("API密钥:"))
@@ -119,10 +144,35 @@ class SettingDialog(QDialog):
         model_layout.addWidget(self._model_edit)
 
         ai_layout.addWidget(self._ai_enable_check)
+        ai_layout.addWidget(self._local_analysis_check)
         ai_layout.addLayout(api_key_layout)
         ai_layout.addLayout(api_url_layout)
         ai_layout.addLayout(model_layout)
         main_layout.addWidget(ai_group)
+
+        # ONNX 使用设置
+        onnx_group = QGroupBox("ONNX使用设置")
+        onnx_layout = QVBoxLayout(onnx_group)
+        self._onnx_face_check = QCheckBox("人脸检测模型（YuNet）")
+        self._onnx_face_check.setToolTip("使用 YuNet ONNX 模型检测人脸；模型缺失时自动回退 MediaPipe")
+        self._onnx_blink_check = QCheckBox("眨眼检测模型（OCEC）")
+        self._onnx_blink_check.setToolTip("使用 OCEC ONNX 模型识别开眼/闭眼；模型缺失时自动回退 EAR 阈值")
+        self._onnx_head_pose_check = QCheckBox("头部姿态模型（6DRepNet）")
+        self._onnx_head_pose_check.setToolTip("使用 6DRepNet ONNX 模型估计头部姿态；模型缺失时自动跳过")
+        self._onnx_gaze_check = QCheckBox("视线估计模型（L2CS）")
+        self._onnx_gaze_check.setToolTip("使用 L2CS ONNX 模型估计视线方向；模型缺失时自动回退虹膜注视估计")
+        self._onnx_gpu_check = QCheckBox("允许调用GPU")
+        self._onnx_gpu_check.setToolTip("勾选后 ONNX 推理优先使用 CUDA（需要 onnxruntime-gpu 且 CUDA/cuBLAS/cuDNN 版本匹配，否则自动回退 CPU）；不勾选则始终使用纯 CPU")
+        self._onnx_status_label = QLabel("")
+        self._onnx_status_label.setWordWrap(True)
+        self._onnx_status_label.setStyleSheet("font-size: 11px; color: #888888; padding-left: 25px;")
+        onnx_layout.addWidget(self._onnx_face_check)
+        onnx_layout.addWidget(self._onnx_blink_check)
+        onnx_layout.addWidget(self._onnx_head_pose_check)
+        onnx_layout.addWidget(self._onnx_gaze_check)
+        onnx_layout.addWidget(self._onnx_gpu_check)
+        onnx_layout.addWidget(self._onnx_status_label)
+        main_layout.addWidget(onnx_group)
 
         # 按钮
         btn_layout = QHBoxLayout()
@@ -143,17 +193,28 @@ class SettingDialog(QDialog):
 
         preset_group = QGroupBox("难度预设")
         preset_layout = QVBoxLayout(preset_group)
+        self._auto_radio = QRadioButton("自动难度（根据训练历史自动推荐）")
         self._easy_radio = QRadioButton("简单（速度较慢，目标较大）")
         self._normal_radio = QRadioButton("普通")
         self._hard_radio = QRadioButton("困难（速度快，时间间隔随机）")
         self._custom_radio = QRadioButton("自定义难度")
         self._normal_radio.setChecked(True)
 
+        preset_layout.addWidget(self._auto_radio)
         preset_layout.addWidget(self._easy_radio)
         preset_layout.addWidget(self._normal_radio)
         preset_layout.addWidget(self._hard_radio)
         preset_layout.addWidget(self._custom_radio)
         layout.addWidget(preset_group)
+
+        self._auto_hint_label = QLabel(
+            "选择“自动难度”后，系统会根据训练历史自动调整难度参数。"
+        )
+        self._auto_hint_label.setWordWrap(True)
+        self._auto_hint_label.setStyleSheet(
+            "font-size: 11px; color: #888888; padding-left: 5px;"
+        )
+        layout.addWidget(self._auto_hint_label)
 
         self._custom_group = QWidget()
         custom_layout = QVBoxLayout(self._custom_group)
@@ -198,6 +259,7 @@ class SettingDialog(QDialog):
         self._custom_group.setEnabled(False)
 
         self._custom_radio.toggled.connect(self._custom_group.setEnabled)
+        self._auto_radio.toggled.connect(self._update_auto_hint)
 
         # 按钮
         btn_layout = QHBoxLayout()
@@ -211,6 +273,41 @@ class SettingDialog(QDialog):
 
         apply_btn.clicked.connect(self._apply_settings)
         cancel_btn.clicked.connect(self.reject)
+
+    def _update_auto_hint(self):
+        """更新“自动难度”的推荐说明。"""
+        settings = GlobalSettings()
+        if not self._auto_radio.isChecked():
+            self._auto_hint_label.setText(
+                "选择“自动难度”后，系统会根据训练历史自动调整难度参数。"
+            )
+            return
+
+        level = settings.auto_difficulty_level()
+        level_names = {
+            DifficultyLevel.EASY: "简单",
+            DifficultyLevel.NORMAL: "普通",
+            DifficultyLevel.HARD: "困难",
+        }
+        records = [
+            r for r in settings.training_records()[:10]
+            if r.avg_attention_score > 0
+        ]
+        if not records:
+            self._auto_hint_label.setText(
+                "暂无有效训练记录，自动难度将使用默认参数（普通难度）。"
+            )
+            return
+
+        avg_attention = sum(r.avg_attention_score for r in records) / len(records)
+        self._auto_hint_label.setText(
+            f"根据最近 {len(records)} 次训练记录（平均注意力 {avg_attention:.0f} 分），"
+            f"系统将自动使用难度：{level_names.get(level, '普通')}；"
+            f"找茬模式：速度 {settings.get_spot_interval()}ms、"
+            f"目标 {settings.get_spot_size()}px；"
+            f"追踪模式：速度 {settings.get_track_interval()}ms、"
+            f"目标 {settings.get_track_size()}px。"
+        )
 
     def _setup_wallpaper_page(self):
         self._wallpaper_page = QWidget()
@@ -294,6 +391,7 @@ class SettingDialog(QDialog):
         hint_label.setStyleSheet("font-size: 11px; color: #888888; padding-left: 25px;")
         training_layout.addWidget(hint_label)
         main_layout.addWidget(training_group)
+        main_layout.addWidget(training_group)
 
         # 底部按钮
         action_layout = QHBoxLayout()
@@ -323,16 +421,40 @@ class SettingDialog(QDialog):
             )
         )
 
+    def _on_adaptive_ear_toggled(self, checked: bool):
+        """自适应EAR开启/关闭时联动阈值输入框与提示"""
+        self._update_ear_hint()
+
+    def _update_ear_hint(self):
+        """根据当前EAR调节模式更新阈值输入框与提示文字"""
+        settings = GlobalSettings()
+        if self._adaptive_ear_radio.isChecked():
+            value = settings.adaptive_ear_threshold()
+            self._ear_spin.setValue(value)
+            self._ear_hint_label.setText(
+                f"💡 自适应EAR已开启，系统会根据历史训练记录自动调节阈值，当前推荐值: {value:.2f}"
+            )
+        else:
+            self._ear_spin.setValue(settings.ear_threshold())
+            self._ear_hint_label.setText(
+                "💡 关闭自适应EAR时可手动调节阈值；开启后系统会根据历史训练记录自动调节阈值"
+            )
+        self._ear_spin.setEnabled(self._manual_ear_radio.isChecked())
+
     def _load_settings(self):
         settings = GlobalSettings()
 
-        self._ear_spin.setValue(settings.ear_threshold())
+        self._adaptive_ear_radio.setChecked(settings.adaptive_ear())
+        self._manual_ear_radio.setChecked(not settings.adaptive_ear())
+        self._update_ear_hint()
         self._sensitivity_slider.setValue(settings.sensitivity())
         self._night_mode_radio.setChecked(settings.night_mode())
         self._day_mode_radio.setChecked(not settings.night_mode())
 
         diff = settings.difficulty_level()
-        if diff == DifficultyLevel.EASY:
+        if diff == DifficultyLevel.AUTO:
+            self._auto_radio.setChecked(True)
+        elif diff == DifficultyLevel.EASY:
             self._easy_radio.setChecked(True)
         elif diff == DifficultyLevel.NORMAL:
             self._normal_radio.setChecked(True)
@@ -353,10 +475,17 @@ class SettingDialog(QDialog):
         self._api_key_edit.setText(settings.api_key())
         self._api_url_edit.setText(settings.api_url())
         self._model_edit.setText(settings.ai_model())
+        self._local_analysis_check.setChecked(settings.local_analysis_enabled())
 
         # 壁纸
         self._wallpaper_enable_check.setChecked(settings.wallpaper_enabled())
         self._force_standard_check.setChecked(settings.force_standard_bg_in_training())
+        self._onnx_face_check.setChecked(settings.onnx_face_detection_enabled())
+        self._onnx_blink_check.setChecked(settings.onnx_blink_detection_enabled())
+        self._onnx_head_pose_check.setChecked(settings.onnx_head_pose_enabled())
+        self._onnx_gaze_check.setChecked(settings.onnx_gaze_enabled())
+        self._onnx_gpu_check.setChecked(settings.onnx_gpu_enabled())
+        self._update_onnx_status_label()
 
         current_path = WallpaperManager().current_path()
         if current_path:
@@ -371,14 +500,19 @@ class SettingDialog(QDialog):
         self._select_wallpaper_btn.setEnabled(settings.wallpaper_enabled())
         self._clear_wallpaper_btn.setEnabled(settings.wallpaper_enabled())
 
+        self._update_auto_hint()
+
     def _apply_settings(self):
         settings = GlobalSettings()
 
         settings.set_ear_threshold(self._ear_spin.value())
+        settings.set_adaptive_ear(self._adaptive_ear_radio.isChecked())
         settings.set_sensitivity(self._sensitivity_slider.value())
         settings.set_night_mode(self._night_mode_radio.isChecked())
 
-        if self._easy_radio.isChecked():
+        if self._auto_radio.isChecked():
+            settings.set_difficulty_level(DifficultyLevel.AUTO)
+        elif self._easy_radio.isChecked():
             settings.set_difficulty_level(DifficultyLevel.EASY)
         elif self._normal_radio.isChecked():
             settings.set_difficulty_level(DifficultyLevel.NORMAL)
@@ -399,8 +533,35 @@ class SettingDialog(QDialog):
         settings.set_api_key(self._api_key_edit.text())
         settings.set_api_url(self._api_url_edit.text())
         settings.set_ai_model(self._model_edit.text())
-
+        settings.set_local_analysis_enabled(self._local_analysis_check.isChecked())
+        settings.set_onnx_face_detection_enabled(self._onnx_face_check.isChecked())
+        settings.set_onnx_blink_detection_enabled(self._onnx_blink_check.isChecked())
+        settings.set_onnx_head_pose_enabled(self._onnx_head_pose_check.isChecked())
+        settings.set_onnx_gaze_enabled(self._onnx_gaze_check.isChecked())
+        settings.set_onnx_gpu_enabled(self._onnx_gpu_check.isChecked())
         self.accept()
+
+    def _update_onnx_status_label(self):
+        """更新 ONNX 模型状态提示"""
+        try:
+            from camera.onnx_vision import (
+                blink_model_available, face_model_available,
+                gaze_model_available, head_pose_model_available,
+            )
+            face_ok = face_model_available()
+            blink_ok = blink_model_available()
+            head_pose_ok = head_pose_model_available()
+            gaze_ok = gaze_model_available()
+        except Exception:
+            face_ok = blink_ok = head_pose_ok = gaze_ok = False
+        def status(ok):
+            return "✓ 已就绪" if ok else "✗ 缺失（运行 tools/download_vision_models.py 下载）"
+        self._onnx_status_label.setText(
+            "模型状态：人脸检测 " + status(face_ok)
+            + "；眨眼检测 " + status(blink_ok)
+            + "；头部姿态 " + status(head_pose_ok)
+            + "；视线估计 " + status(gaze_ok)
+        )
 
     def _apply_wallpaper_settings(self):
         settings = GlobalSettings()
