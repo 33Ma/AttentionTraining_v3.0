@@ -10,6 +10,8 @@ class TeacherCoachImportSmokeTests(unittest.TestCase):
         import ai.teacher_coach_logic
         import ai.teacher_report_logic
         import ui.teacher_coach_dialog
+        import ui.main_window
+        import ui.teacher_report_dialog
         self.assertTrue(ai.teacher_coach.TeacherCoachManager)
         self.assertTrue(ui.teacher_coach_dialog.TeacherCoachDialog)
 

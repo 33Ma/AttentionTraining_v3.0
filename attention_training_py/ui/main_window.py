@@ -19,6 +19,8 @@ from ui.user_management_dialog import UserManagementDialog
 from ui.time_select_dialog import TimeSelectDialog
 from ui.mode_select_dialog import ModeSelectDialog
 from utils.wallpaper_manager import WallpaperManager
+from ui.ai_coach_dialog import AICoachDialog
+from ui.teacher_coach_dialog import TeacherCoachDialog
 
 
 class MainWindow(QMainWindow):
@@ -131,6 +133,7 @@ class MainWindow(QMainWindow):
 
             buttons = [
                 ("开始训练", self._on_start_training),
+                ("💡 智能推荐", self._on_smart_recommend),
                 ("训练设置", self._on_training_settings),
                 ("训练记录", self._on_training_records),
                 ("🏆 成就", self._on_achievements)
@@ -201,6 +204,18 @@ class MainWindow(QMainWindow):
 
             self._main_layout.addLayout(h_layout)
             self._role_specific_buttons.append(teacher_btn)
+            coach_btn = QPushButton("🤖 AI助教")
+            coach_btn.setFixedSize(btn_width, btn_height - 5)
+            coach_btn.setStyleSheet(btn_style + "background-color: #9C27B0;")
+            coach_btn.clicked.connect(self._on_teacher_coach)
+
+            h_layout = QHBoxLayout()
+            h_layout.addStretch()
+            h_layout.addWidget(coach_btn)
+            h_layout.addStretch()
+
+            self._main_layout.addLayout(h_layout)
+            self._role_specific_buttons.append(coach_btn)
 
         if role == UserRole.ADMIN:
             user_btn = QPushButton("👥 用户管理")
@@ -215,6 +230,20 @@ class MainWindow(QMainWindow):
 
             self._main_layout.addLayout(h_layout)
             self._role_specific_buttons.append(user_btn)
+
+        if role == UserRole.STUDENT:
+            coach_btn = QPushButton("🤖 AI教练")
+            coach_btn.setFixedSize(btn_width, btn_height - 5)
+            coach_btn.setStyleSheet(btn_style + "background-color: #009688;")
+            coach_btn.clicked.connect(self._on_ai_coach)
+
+            h_layout = QHBoxLayout()
+            h_layout.addStretch()
+            h_layout.addWidget(coach_btn)
+            h_layout.addStretch()
+
+            self._main_layout.addLayout(h_layout)
+            self._role_specific_buttons.append(coach_btn)
 
     def _clear_role_specific_buttons(self):
         """清除角色特定按钮"""
@@ -363,34 +392,68 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
             QMessageBox.critical(self, "启动训练失败", f"无法启动训练:\n{str(e)}")
 
+    def _on_smart_recommend(self):
+        """个性化智能推荐（本地 ONNX 模型优先，云端大模型/规则兜底）"""
+        try:
+            session = UserSession()
+            if session.is_training_active():
+                QMessageBox.warning(self, "训练进行中", "当前有训练正在进行中，请先完成或结束当前训练。")
+                return
+
+            from ui.recommend_dialog import RecommendDialog
+            dlg = RecommendDialog(self)
+            if dlg.exec() == RecommendDialog.Accepted and dlg.accepted_recommendation():
+                level = dlg.recommended_difficulty_level()
+                if level is not None:
+                    GlobalSettings().set_difficulty_level(level)
+                self._start_training_with_mode(dlg.recommended_mode())
+        except Exception as e:
+            print(f"On smart recommend error: {e}")
+            traceback.print_exc()
+            QMessageBox.critical(self, "错误", f"无法获取智能推荐:\n{str(e)}")
+
     def _show_mode_selection(self):
+        """选择训练时长与游戏模式后开始训练"""
         try:
             time_dlg = TimeSelectDialog(self)
             if time_dlg.exec() == TimeSelectDialog.Accepted:
                 minutes = time_dlg.selected_minutes()
                 mode_dlg = ModeSelectDialog(self)
                 if mode_dlg.exec() == ModeSelectDialog.Accepted:
-                    mode = mode_dlg.selected_mode()
-
-                    if self._train_win is not None:
-                        try:
-                            self._train_win.training_finished.disconnect(self._on_training_finished)
-                        except:
-                            pass
-                        self._train_win.close()
-                        self._train_win.deleteLater()
-                        self._train_win = None
-
-                    self._train_win = TrainingWindow(minutes, mode)
-                    self._train_win.training_finished.connect(self._on_training_finished)
-                    self._train_win.show()
-
-                    self.hide()
-                    self._is_training_mode = True
+                    self._launch_training(minutes, mode_dlg.selected_mode())
         except Exception as e:
             print(f"Show mode selection error: {e}")
             traceback.print_exc()
             QMessageBox.critical(self, "启动训练失败", f"无法启动训练:\n{str(e)}")
+
+    def _start_training_with_mode(self, mode: str):
+        """按推荐模式开始训练（仍需选择训练时长）"""
+        try:
+            time_dlg = TimeSelectDialog(self)
+            if time_dlg.exec() == TimeSelectDialog.Accepted:
+                self._launch_training(time_dlg.selected_minutes(), mode)
+        except Exception as e:
+            print(f"Start training with mode error: {e}")
+            traceback.print_exc()
+            QMessageBox.critical(self, "启动训练失败", f"无法启动训练:\n{str(e)}")
+
+    def _launch_training(self, minutes: int, mode: str):
+        """创建训练窗口并进入训练"""
+        if self._train_win is not None:
+            try:
+                self._train_win.training_finished.disconnect(self._on_training_finished)
+            except Exception:
+                pass
+            self._train_win.close()
+            self._train_win.deleteLater()
+            self._train_win = None
+
+        self._train_win = TrainingWindow(minutes, mode)
+        self._train_win.training_finished.connect(self._on_training_finished)
+        self._train_win.show()
+
+        self.hide()
+        self._is_training_mode = True
 
     def _on_training_finished(self):
         """训练完成回调"""
@@ -467,6 +530,16 @@ class MainWindow(QMainWindow):
             print(f"On teacher report error: {e}")
             QMessageBox.critical(self, "错误", f"无法打开班级报告:\n{str(e)}")
 
+    def _on_teacher_coach(self):
+        """AI助教对话"""
+        try:
+            dlg = TeacherCoachDialog(self)
+            dlg.exec()
+        except Exception as e:
+            print(f"On teacher coach error: {e}")
+            traceback.print_exc()
+            QMessageBox.critical(self, "错误", f"无法打开AI助教:\n{str(e)}")
+
     def _on_user_management(self):
         """用户管理"""
         try:
@@ -475,6 +548,16 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"On user management error: {e}")
             QMessageBox.critical(self, "错误", f"无法打开用户管理:\n{str(e)}")
+
+    def _on_ai_coach(self):
+        """AI教练对话"""
+        try:
+            dlg = AICoachDialog(self)
+            dlg.exec()
+        except Exception as e:
+            print(f"On AI coach error: {e}")
+            traceback.print_exc()
+            QMessageBox.critical(self, "错误", f"无法打开AI教练:\n{str(e)}")
 
     def _on_switch_user(self):
                 """切换用户"""

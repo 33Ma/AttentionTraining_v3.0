@@ -17,10 +17,13 @@ from core.user_session import UserSession
 from core.paths import app_data_dir
 from ai.teacher_report_logic import (
     composite_improvement,
+    compute_class_stats,
     compute_class_summaries,
     format_duration,
     normalized_game_score,
 )
+
+from ui.teacher_coach_dialog import TeacherCoachDialog
 
 
 class TeacherReportDialog(QDialog):
@@ -79,6 +82,9 @@ class TeacherReportDialog(QDialog):
         self._class_report_btn = QPushButton("📈 生成班级报告")
         self._class_report_btn.setFixedSize(140, 38)
         self._class_report_btn.clicked.connect(self._on_generate_class_report)
+        self._coach_btn = QPushButton("🤖 咨询AI助教")
+        self._coach_btn.setFixedSize(140, 38)
+        self._coach_btn.clicked.connect(self._on_ask_coach)
 
         control_layout.addWidget(range_label)
         control_layout.addWidget(self._date_range_combo)
@@ -86,6 +92,7 @@ class TeacherReportDialog(QDialog):
         control_layout.addWidget(self._refresh_btn)
         control_layout.addWidget(self._export_btn)
         control_layout.addWidget(self._class_report_btn)
+        control_layout.addWidget(self._coach_btn)
         main_layout.addLayout(control_layout)
 
         # 统计卡片
@@ -463,6 +470,17 @@ class TeacherReportDialog(QDialog):
 
     def _on_date_range_changed(self, index: int):
         self._refresh_report()
+    def _on_ask_coach(self):
+        """携带当前班级汇总打开 AI 助教。"""
+        if not self._summaries:
+            QMessageBox.information(self, "提示", "暂无学生数据，无法咨询助教。")
+            return
+        stats = compute_class_stats(self._summaries)
+        dlg = TeacherCoachDialog(
+            self,
+            class_context={"summaries": self._summaries, "stats": stats},
+        )
+        dlg.exec()
 
     def _export_to_csv(self):
         file_name = QFileDialog.getSaveFileName(
