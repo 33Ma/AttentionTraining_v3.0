@@ -28,6 +28,17 @@ def cleanup_resources():
         print(f"Cleanup AI manager error: {e}")
 
     try:
+        from ai.ai_coach import AICoachManager
+        AICoachManager.instance().cleanup()
+    except Exception as e:
+        print(f"Cleanup AI coach manager error: {e}")
+    try:
+        from ai.teacher_coach import TeacherCoachManager
+        TeacherCoachManager.instance().cleanup()
+    except Exception as e:
+        print(f"Cleanup teacher coach manager error: {e}")
+
+    try:
         # 保存所有设置
         GlobalSettings().save_to_file()
     except Exception as e:
