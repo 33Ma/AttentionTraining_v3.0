@@ -2,7 +2,7 @@
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit, QPushButton, QTabWidget, QWidget, QGroupBox, QCheckBox, QMessageBox, QComboBox
 
-from core.user_manager import UserManager, UserRole
+from core.user_manager import UserManager, UserRole, UserInfo
 from core.settings import GlobalSettings
 
 
