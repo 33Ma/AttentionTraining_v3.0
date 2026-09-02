@@ -36,7 +36,8 @@ class AIAnalysisManager(QObject):
     def submit_analysis(self, avg_attention: int, total_blinks: int, max_consecutive_hits: int,
                         game_score: int, game_mode: str, duration_minutes: int,
                         api_key: str, api_url: str, model: str,
-                        avg_gaze_score: int = 0, avg_gaze_distance: float = 0.0) -> int:
+                        avg_gaze_score: int = 0, avg_gaze_distance: float = 0.0,
+                        difficulty: str = "normal", face_detected: Optional[bool] = None) -> int:
         """提交分析请求"""
         if self._shutting_down:
             return 0
@@ -56,7 +57,9 @@ class AIAnalysisManager(QObject):
             'api_url': api_url,
             'model': model,
             'avg_gaze_score': avg_gaze_score,
-            'avg_gaze_distance': avg_gaze_distance
+            'avg_gaze_distance': avg_gaze_distance,
+            'difficulty': difficulty,
+            'face_detected': face_detected
         }
 
         locker = QMutexLocker(self._mutex)
@@ -123,16 +126,9 @@ class AIAnalysisManager(QObject):
         self._active_worker = AIThreadWorker()
         self._active_worker.moveToThread(self._active_thread)
 
-        # 使用 lambda 传递参数
-        self._active_thread.started.connect(
-            lambda: self._active_worker.process_training_analysis(
-                request['avg_attention'], request['total_blinks'],
-                request['max_consecutive_hits'], request['game_score'],
-                request['game_mode'], request['duration_minutes'],
-                request['api_key'], request['api_url'], request['model'],
-                request['avg_gaze_score'], request['avg_gaze_distance']
-            )
-        )
+        # 先存参数，再连接 QObject 槽方法，确保在工作线程内执行
+        self._active_worker.set_request(request)
+        self._active_thread.started.connect(self._active_worker.run_current)
 
         self._active_worker.analysis_ready.connect(self._on_worker_ready)
         self._active_worker.analysis_error.connect(self._on_worker_error)
@@ -157,11 +153,17 @@ class AIAnalysisManager(QObject):
                     self._active_workers.pop(i)
                     break
             locker.unlock()
+        if self._active_worker:
+            self._active_worker.deleteLater()
+            self._active_worker = None
+        self._active_thread = None
+        self._current_request_id = 0
+        QTimer.singleShot(10, self._process_queue)
 
     def _on_worker_finished(self):
-        self._cleanup_worker()
-        # 延迟处理下一个请求
-        QTimer.singleShot(10, self._process_queue)
+        # 只请求线程退出事件循环，不在主线程阻塞等待或销毁仍可能运行的线程
+        if self._active_thread and self._active_thread.isRunning():
+            self._active_thread.quit()
 
     def _on_worker_ready(self, analysis: str):
         self.analysis_ready.emit(self._current_request_id, analysis)
@@ -170,16 +172,15 @@ class AIAnalysisManager(QObject):
         self.analysis_error.emit(self._current_request_id, error)
 
     def _cleanup_worker(self):
-        if self._active_thread:
-            if self._active_thread.isRunning():
-                self._active_thread.quit()
-                self._active_thread.wait(500)
-            self._active_thread = None
+        """安全清理：线程仍在运行时不阻塞、不销毁，交由 _on_thread_finished。"""
+        if self._active_thread and self._active_thread.isRunning():
+            return
 
+        if self._active_thread:
+            self._active_thread = None
         if self._active_worker:
             self._active_worker.deleteLater()
             self._active_worker = None
-
         self._current_request_id = 0
 
     def cleanup(self):

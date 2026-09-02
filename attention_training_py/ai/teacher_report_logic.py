@@ -24,6 +24,36 @@ def _field(record: Any, name: str, default: Any = None) -> Any:
     return getattr(record, name, default)
 
 
+def blinks_per_minute(record: Any) -> float:
+    """每分钟眨眼次数 = 总眨眼次数 / 训练时长（分钟）；时长缺失或为 0 时返回 0。"""
+    total = int(_field(record, "total_blinks", 0) or 0)
+    minutes = int(_field(record, "duration_minutes", 0) or 0)
+    if minutes <= 0:
+        return 0.0
+    return total / minutes
+
+
+GAME_MODES = ("find_difference", "dynamic_tracking")
+GAME_MODE_LABELS = (("find_difference", "找茬"), ("dynamic_tracking", "动态追踪"))
+
+
+def _mode_records(records: List[Any], mode: str) -> List[Any]:
+    """按模式过滤记录；未知/空模式按找茬处理（与 score_ratio 归一语义一致）。"""
+    if mode == "dynamic_tracking":
+        return [r for r in records if _field(r, "game_mode", "") == "dynamic_tracking"]
+    return [r for r in records if _field(r, "game_mode", "") != "dynamic_tracking"]
+
+
+def improvement_by_mode(records: List[Any]) -> Dict[str, float]:
+    """每种模式单独计算进步幅度（%）；某模式不足两次记录时按旧约定返回 0（仅一次不展示趋势）。"""
+    return {mode: composite_improvement(_mode_records(records, mode)) for mode in GAME_MODES}
+
+
+def trainings_by_mode(records: List[Any]) -> Dict[str, int]:
+    """每种模式的训练次数。"""
+    return {mode: len(_mode_records(records, mode)) for mode in GAME_MODES}
+
+
 def normalized_game_score(record: Any) -> float:
     """游戏得分归一 0-100：找茬按“模式×难度”基准，动态追踪按 /100。"""
     return (
@@ -31,6 +61,7 @@ def normalized_game_score(record: Any) -> float:
             int(_field(record, "game_score", 0) or 0),
             _field(record, "game_mode", "find_difference") or "find_difference",
             _field(record, "difficulty", "normal") or "normal",
+            int(_field(record, "duration_minutes", 1) or 1),
         )
         * 100.0
     )
@@ -121,6 +152,8 @@ def compute_student_summary(
         "avg_composite": 0,
         "achievements": int(achievements or 0),
         "improvement": 0.0,
+        "improvement_by_mode": {mode: 0.0 for mode in GAME_MODES},
+        "trainings_by_mode": {mode: 0 for mode in GAME_MODES},
         "last_training": "无",
     }
     if not filtered:
@@ -140,6 +173,7 @@ def compute_student_summary(
     summary["avg_attention"] = attention_sum // len(filtered)
     summary["avg_game_score"] = int(round(score_sum / len(filtered)))
     summary["avg_composite"] = composite_sum // len(filtered)
+    summary["trainings_by_mode"] = trainings_by_mode(filtered)
 
     last_dt = _parse_dt(_field(filtered[0], "date_time", ""))
     if last_dt is not None:
@@ -147,6 +181,7 @@ def compute_student_summary(
 
     if len(records) >= 2:
         summary["improvement"] = composite_improvement(records)
+        summary["improvement_by_mode"] = improvement_by_mode(records)
     return summary
 
 
@@ -158,6 +193,7 @@ def compute_class_stats(summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
     valid_count = 0
     top_improvement = -101.0
     top_student = None
+    top_mode = None
 
     for s in summaries:
         total_minutes += s["total_minutes"]
@@ -165,17 +201,50 @@ def compute_class_stats(summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
         if s["total_trainings"] > 0:
             valid_count += 1
             total_attention += s["avg_attention"]
-        if s["improvement"] > top_improvement and s["total_trainings"] >= 3:
-            top_improvement = s["improvement"]
-            top_student = s
+        by_mode = s.get("improvement_by_mode")
+        tr_by_mode = s.get("trainings_by_mode")
+        if by_mode and tr_by_mode:
+            candidates = [
+                (mode, float(by_mode.get(mode, 0.0) or 0.0), tr_by_mode.get(mode, 0))
+                for mode in GAME_MODES
+            ]
+        else:
+            candidates = [
+                (None, float(s.get("improvement", 0.0) or 0.0), int(s.get("total_trainings", 0)))
+            ]
+        for mode, imp, sessions in candidates:
+            if imp > top_improvement and sessions >= 3:
+                top_improvement = imp
+                top_student = s
+                top_mode = mode
 
     class_composite = (
         sum(s["avg_composite"] for s in summaries) // len(summaries)
         if summaries
         else 0
     )
-    improving = sum(1 for s in summaries if s["improvement"] > 5)
-    declining = sum(1 for s in summaries if s["improvement"] < -5)
+    def _student_improvements(s: Dict[str, Any]) -> List[float]:
+        by_mode = s.get("improvement_by_mode")
+        if by_mode:
+            return [float(v or 0.0) for v in by_mode.values()]
+        return [float(s.get("improvement", 0.0) or 0.0)]
+
+    improving = sum(1 for s in summaries if max(_student_improvements(s)) > 5)
+    declining = sum(1 for s in summaries if min(_student_improvements(s)) < -5)
+    improving_by_mode = {
+        mode: sum(
+            1 for s in summaries
+            if float((s.get("improvement_by_mode") or {}).get(mode, 0.0) or 0.0) > 5
+        )
+        for mode in GAME_MODES
+    }
+    declining_by_mode = {
+        mode: sum(
+            1 for s in summaries
+            if float((s.get("improvement_by_mode") or {}).get(mode, 0.0) or 0.0) < -5
+        )
+        for mode in GAME_MODES
+    }
     best = max(summaries, key=lambda s: s["avg_composite"]) if summaries else None
     worst = min(summaries, key=lambda s: s["avg_composite"]) if summaries else None
 
@@ -188,10 +257,13 @@ def compute_class_stats(summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
         "class_avg_composite": class_composite,
         "improving": improving,
         "declining": declining,
-        "stable": len(summaries) - improving - declining,
+        "stable": max(0, len(summaries) - improving - declining),
         "best": best,
         "worst": worst,
         "top_improvement_student": top_student,
+        "top_improvement_mode": top_mode,
+        "improving_by_mode": improving_by_mode,
+        "declining_by_mode": declining_by_mode,
     }
 
 

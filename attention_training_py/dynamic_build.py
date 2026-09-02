@@ -38,6 +38,7 @@ EXCLUDE_DIRS = {
     "build", "dist", "venv", ".venv", "env", "users", "node_modules",
     # PyInstaller 钩子目录：内部文件（如 hook-mediapipe.py）无需作为业务模块打包
     "hooks",
+    "tests",
 }
 
 # 不参与打包的顶层脚本（入口/调试/构建工具/旧版独立文件）

@@ -32,11 +32,28 @@ CREATE TABLE IF NOT EXISTS training_records (
     game_score INTEGER NOT NULL DEFAULT 0,
     avg_ear REAL NOT NULL DEFAULT 0.0,
     avg_gaze_score INTEGER NOT NULL DEFAULT 0,
-    avg_gaze_distance REAL NOT NULL DEFAULT 0.0
+    avg_gaze_distance REAL NOT NULL DEFAULT 0.0,
+    max_consecutive_hits INTEGER NOT NULL DEFAULT 0,
+    face_detected INTEGER NOT NULL DEFAULT -1,
+    hit_rate REAL NOT NULL DEFAULT 0.0,
+    avg_response_time REAL NOT NULL DEFAULT 0.0,
+    path_efficiency REAL NOT NULL DEFAULT 0.0,
+    composite_score INTEGER NOT NULL DEFAULT -1
 );
 
 CREATE INDEX IF NOT EXISTS idx_training_records_username_datetime
     ON training_records(username, date_time DESC);
+
+CREATE TABLE IF NOT EXISTS coach_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    create_time TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_coach_messages_username_id
+    ON coach_messages(username, id);
 """
 
 
@@ -82,6 +99,30 @@ class Database:
             self._ensure_column(
                 conn, "training_records", "avg_gaze_distance",
                 "REAL NOT NULL DEFAULT 0.0",
+            )
+            self._ensure_column(
+                conn, "training_records", "max_consecutive_hits",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(
+                conn, "training_records", "face_detected",
+                "INTEGER NOT NULL DEFAULT -1",
+            )
+            self._ensure_column(
+                conn, "training_records", "hit_rate",
+                "REAL NOT NULL DEFAULT 0.0",
+            )
+            self._ensure_column(
+                conn, "training_records", "avg_response_time",
+                "REAL NOT NULL DEFAULT 0.0",
+            )
+            self._ensure_column(
+                conn, "training_records", "path_efficiency",
+                "REAL NOT NULL DEFAULT 0.0",
+            )
+            self._ensure_column(
+                conn, "training_records", "composite_score",
+                "INTEGER NOT NULL DEFAULT -1",
             )
 
     @staticmethod
@@ -150,7 +191,10 @@ class Database:
             """
             SELECT date_time, duration_minutes, game_mode, difficulty,
                    avg_attention_score, total_blinks, game_score, avg_ear,
-                   avg_gaze_score, avg_gaze_distance
+                   avg_gaze_score, avg_gaze_distance,
+                   max_consecutive_hits, face_detected,
+                   hit_rate, avg_response_time, path_efficiency,
+                   composite_score
             FROM training_records
             WHERE username = ?
             ORDER BY date_time DESC, id DESC
@@ -168,8 +212,11 @@ class Database:
                 INSERT INTO training_records (
                     username, date_time, duration_minutes, game_mode, difficulty,
                     avg_attention_score, total_blinks, game_score, avg_ear,
-                    avg_gaze_score, avg_gaze_distance
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    avg_gaze_score, avg_gaze_distance,
+                    max_consecutive_hits, face_detected,
+                    hit_rate, avg_response_time, path_efficiency,
+                    composite_score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -184,13 +231,99 @@ class Database:
                         record["avg_ear"],
                         record.get("avg_gaze_score", 0),
                         record.get("avg_gaze_distance", 0.0),
+                        record.get("max_consecutive_hits", 0),
+                        record.get("face_detected", -1),
+                        record.get("hit_rate", 0.0),
+                        record.get("avg_response_time", 0.0),
+                        record.get("path_efficiency", 0.0),
+                        record.get("composite_score", -1),
                     )
                     for record in records
                 ],
             )
 
+    def insert_training_record(
+        self, username: str, record: Dict[str, Any]
+    ) -> None:
+        """Append one training record without rewriting the whole history."""
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO training_records (
+                    username, date_time, duration_minutes, game_mode, difficulty,
+                    avg_attention_score, total_blinks, game_score, avg_ear,
+                    avg_gaze_score, avg_gaze_distance,
+                    max_consecutive_hits, face_detected,
+                    hit_rate, avg_response_time, path_efficiency,
+                    composite_score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    username,
+                    record["date_time"],
+                    record["duration_minutes"],
+                    record["game_mode"],
+                    record["difficulty"],
+                    record["avg_attention_score"],
+                    record["total_blinks"],
+                    record["game_score"],
+                    record["avg_ear"],
+                    record.get("avg_gaze_score", 0),
+                    record.get("avg_gaze_distance", 0.0),
+                    record.get("max_consecutive_hits", 0),
+                    record.get("face_detected", -1),
+                    record.get("hit_rate", 0.0),
+                    record.get("avg_response_time", 0.0),
+                    record.get("path_efficiency", 0.0),
+                    record.get("composite_score", -1),
+                ),
+            )
+
     def clear_training_records(self, username: str) -> None:
         self.execute("DELETE FROM training_records WHERE username = ?", (username,))
+
+    # ------------------------------------------------------------------
+    # AI 教练对话
+    # ------------------------------------------------------------------
+    def fetch_coach_messages(self, username: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """返回用户最近 limit 条教练对话，按时间正序排列。"""
+        if limit <= 0:
+            return []
+        rows = self.query(
+            """
+            SELECT id, username, role, content, create_time
+            FROM coach_messages
+            WHERE username = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (username, limit),
+        )
+        return list(reversed(rows))
+
+    def add_coach_message(
+        self,
+        username: str,
+        role: str,
+        content: str,
+        create_time: Optional[str] = None,
+    ) -> None:
+        """追加一条教练对话消息（role 为 user / assistant）。"""
+        from datetime import datetime
+
+        if create_time is None:
+            create_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.execute(
+            """
+            INSERT INTO coach_messages (username, role, content, create_time)
+            VALUES (?, ?, ?, ?)
+            """,
+            (username, role, content, create_time),
+        )
+
+    def clear_coach_messages(self, username: str) -> None:
+        """清空指定用户的教练对话记录。"""
+        self.execute("DELETE FROM coach_messages WHERE username = ?", (username,))
 
 
 def get_database() -> Database:

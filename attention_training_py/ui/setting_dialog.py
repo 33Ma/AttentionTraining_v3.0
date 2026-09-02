@@ -19,11 +19,14 @@ class SettingDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("训练设置")
-        self.setFixedSize(1100, 900)
+        self.setMinimumSize(1100, 900)
 
         self._setup_ui()
         self._load_settings()
         self._apply_style_sheet()
+        # 固定为布局实际所需的高度：避免拖动窗口时在 900 与布局最小高度
+        # 之间来回跳变，导致界面忽大忽小、底部内容被裁剪。
+        self.setFixedSize(1100, max(900, self.layout().minimumSize().height()))
 
         settings = GlobalSettings()
         settings.settings_changed.connect(self._apply_style_sheet)
@@ -129,13 +132,23 @@ class SettingDialog(QDialog):
         self._api_key_edit = QLineEdit()
         self._api_key_edit.setEchoMode(QLineEdit.Password)
         self._api_key_edit.setPlaceholderText("请输入API密钥 (sk-...)")
+        self._api_key_show_btn = QPushButton("显示")
+        self._api_key_show_btn.setCheckable(True)
+        self._api_key_show_btn.setCursor(Qt.PointingHandCursor)
+        self._api_key_show_btn.setToolTip("点击显示/隐藏 API 密钥")
+        self._api_key_show_btn.toggled.connect(self._on_api_key_visibility_toggled)
         api_key_layout.addWidget(self._api_key_edit)
+        api_key_layout.addWidget(self._api_key_show_btn)
 
         api_url_layout = QHBoxLayout()
         api_url_layout.addWidget(QLabel("API地址:"))
         self._api_url_edit = QLineEdit()
         self._api_url_edit.setPlaceholderText("https://api.openai.com/v1/chat/completions")
         api_url_layout.addWidget(self._api_url_edit)
+
+        # API 密钥/地址禁止输入空格：输入或粘贴时立即清除，避免空格被当作有效字符计入长度
+        self._api_key_edit.textChanged.connect(lambda: self._on_api_whitespace_filtered(self._api_key_edit))
+        self._api_url_edit.textChanged.connect(lambda: self._on_api_whitespace_filtered(self._api_url_edit))
 
         model_layout = QHBoxLayout()
         model_layout.addWidget(QLabel("模型名称:"))
@@ -194,9 +207,9 @@ class SettingDialog(QDialog):
         preset_group = QGroupBox("难度预设")
         preset_layout = QVBoxLayout(preset_group)
         self._auto_radio = QRadioButton("自动难度（根据训练历史自动推荐）")
-        self._easy_radio = QRadioButton("简单（速度较慢，目标较大）")
-        self._normal_radio = QRadioButton("普通")
-        self._hard_radio = QRadioButton("困难（速度快，时间间隔随机）")
+        self._easy_radio = QRadioButton("简单（目标大，位置集中）")
+        self._normal_radio = QRadioButton("普通（目标适中）")
+        self._hard_radio = QRadioButton("困难（目标小，位置分散）")
         self._custom_radio = QRadioButton("自定义难度")
         self._normal_radio.setChecked(True)
 
@@ -303,10 +316,10 @@ class SettingDialog(QDialog):
         self._auto_hint_label.setText(
             f"根据最近 {len(records)} 次训练记录（平均注意力 {avg_attention:.0f} 分），"
             f"系统将自动使用难度：{level_names.get(level, '普通')}；"
-            f"找茬模式：速度 {settings.get_spot_interval()}ms、"
-            f"目标 {settings.get_spot_size()}px；"
-            f"追踪模式：速度 {settings.get_track_interval()}ms、"
-            f"目标 {settings.get_track_size()}px。"
+            f"找茬模式：点出现间隔 {settings.get_spot_interval()}ms、"
+            f"点大小 {settings.get_spot_size()}px；"
+            f"追踪模式：移动间隔 {settings.get_track_interval()}ms、"
+            f"目标大小 {settings.get_track_size()}px。"
         )
 
     def _setup_wallpaper_page(self):
@@ -391,7 +404,6 @@ class SettingDialog(QDialog):
         hint_label.setStyleSheet("font-size: 11px; color: #888888; padding-left: 25px;")
         training_layout.addWidget(hint_label)
         main_layout.addWidget(training_group)
-        main_layout.addWidget(training_group)
 
         # 底部按钮
         action_layout = QHBoxLayout()
@@ -424,6 +436,20 @@ class SettingDialog(QDialog):
     def _on_adaptive_ear_toggled(self, checked: bool):
         """自适应EAR开启/关闭时联动阈值输入框与提示"""
         self._update_ear_hint()
+
+    def _on_api_whitespace_filtered(self, edit):
+        """清除 API 输入框中的空白字符（空格/制表符等），防止空格被计入密钥长度。"""
+        text = edit.text()
+        cleaned = ''.join(text.split())
+        if cleaned != text:
+            edit.setText(cleaned)
+
+    def _on_api_key_visibility_toggled(self, checked: bool):
+        """切换 API 密钥的显示/隐藏"""
+        self._api_key_edit.setEchoMode(
+            QLineEdit.Normal if checked else QLineEdit.Password
+        )
+        self._api_key_show_btn.setText("隐藏" if checked else "显示")
 
     def _update_ear_hint(self):
         """根据当前EAR调节模式更新阈值输入框与提示文字"""
@@ -530,8 +556,8 @@ class SettingDialog(QDialog):
             settings.set_custom_difficulty(cd)
 
         settings.set_ai_enabled(self._ai_enable_check.isChecked())
-        settings.set_api_key(self._api_key_edit.text())
-        settings.set_api_url(self._api_url_edit.text())
+        settings.set_api_key(self._api_key_edit.text().strip())
+        settings.set_api_url(self._api_url_edit.text().strip())
         settings.set_ai_model(self._model_edit.text())
         settings.set_local_analysis_enabled(self._local_analysis_check.isChecked())
         settings.set_onnx_face_detection_enabled(self._onnx_face_check.isChecked())

@@ -13,6 +13,9 @@ from .settings import GlobalSettings
 class LLMClient(QObject):
     """LLM 客户端 - 用于与各种 AI API 通信"""
 
+    # 注意：多轮"AI 教练对话"已迁移到 ai/ai_coach.py（AICoachManager），
+    # 其中 advice_ready / report_ready 等信号已并入并投入使用；
+    # 本类保留这些信号以兼容既有调用（如设置页连接测试）。
     analysis_text_ready = Signal(str)
     analysis_ready = Signal(str)
     advice_ready = Signal(str)
@@ -203,7 +206,7 @@ class LLMClient(QObject):
             return
 
         prompt = "根据以下训练历史，推荐最适合的游戏模式（find_difference或dynamic_tracking）和难度（Easy/Normal/Hard）：\n\n"
-        for record in history[-5:]:  # 只取最近5条
+        for record in history[:5]:  # history 为“新→旧”，只取最近 5 条
             prompt += f"- 模式: {record.get('game_mode', 'unknown')}, "
             prompt += f"注意力: {record.get('avg_attention', 0)}, "
             prompt += f"得分: {record.get('game_score', 0)}\n"
@@ -274,9 +277,10 @@ class LLMClient(QObject):
             "max_tokens": 800
         }
 
-        # 创建网络请求
+        # 创建网络请求（兼容只填根地址的情况，自动补全 /chat/completions）
+        from ai.coach_logic import normalize_chat_completions_url
         request = QNetworkRequest()
-        request.setUrl(QUrl(self._api_url))
+        request.setUrl(QUrl(normalize_chat_completions_url(self._api_url)))
         request.setHeader(QNetworkRequest.ContentTypeHeader, "application/json")
         request.setRawHeader(b"Authorization", f"Bearer {self._api_key}".encode())
 
@@ -317,6 +321,7 @@ class LLMClient(QObject):
 
         if reply.error() != QNetworkReply.NoError:
             error_msg = self._get_error_message(reply)
+            print('[AI][llm] reply error: ' + str(error_msg))
             self._emit_error(callback_type, error_msg)
             reply.deleteLater()
             return
@@ -325,28 +330,27 @@ class LLMClient(QObject):
         reply.deleteLater()
 
         try:
-            doc = QJsonDocument.fromJson(response_data)
-            if doc.isNull():
-                self._emit_error(callback_type, "无效的JSON响应")
+            raw_bytes = response_data.data()
+            if not isinstance(raw_bytes, bytes):
+                raw_bytes = bytes(response_data)
+            payload = json.loads(raw_bytes.decode('utf-8', errors='ignore'))
+            if not isinstance(payload, dict) or not payload.get('choices'):
+                self._emit_error(callback_type, '响应格式错误')
                 return
 
-            obj = doc.object()
-            if not obj.contains("choices"):
-                self._emit_error(callback_type, "响应格式错误")
+            choices = payload['choices']
+            if not choices:
+                self._emit_error(callback_type, '没有选择结果')
                 return
 
-            choices = obj["choices"].toArray()
-            if choices.isEmpty():
-                self._emit_error(callback_type, "没有选择结果")
-                return
-
-            content = choices[0].toObject()["message"].toObject()["content"].toString()
+            message = (choices[0] or {}).get('message') or {}
+            content = message.get('content') or ''
+            print('[AI][llm] reply ok content len=' + str(len(content)))
             self._handle_response(callback_type, content)
+            self.request_finished.emit()
 
         except Exception as e:
-            self._emit_error(callback_type, f"解析响应失败: {str(e)}")
-
-        self.request_finished.emit()
+            self._emit_error(callback_type, '解析响应失败: ' + str(e))
 
     def _get_error_message(self, reply: QNetworkReply) -> str:
         """获取错误信息"""
@@ -365,6 +369,7 @@ class LLMClient(QObject):
             return f"网络错误: {error_string} (状态码: {status_code})"
 
     def _emit_error(self, callback_type: str, error_msg: str):
+        print('[AI][llm] emit error: ' + str(error_msg))
         """发送错误信号"""
         if callback_type == "analysis":
             self.analysis_text_ready.emit(error_msg)
@@ -384,6 +389,7 @@ class LLMClient(QObject):
             self.report_ready.emit(content)
 
     def _parse_recommendation(self, content: str):
+        print('[AI][llm] recommend raw len=' + str(len(content)) + ' text=' + str(content[:120]))
         """解析推荐结果"""
         if "find_difference" in content:
             difficulty = "Hard" if "Hard" in content else "Easy" if "Easy" in content else "Normal"
@@ -395,6 +401,7 @@ class LLMClient(QObject):
             self.recommendation_ready.emit("find_difference", "Normal")
 
     def _on_timeout(self):
+        print('[AI][llm] timeout fired')
         """超时处理"""
         locker = QMutexLocker(self._mutex)
         replies_copy = self._active_replies.copy()
@@ -421,7 +428,8 @@ class LLMClient(QObject):
         analysis = "📊 训练数据概览\n"
         analysis += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         analysis += f"• 平均注意力分数：{avg_attention}/100\n"
-        analysis += f"• 总眨眼次数：{total_blinks}次\n"
+        blink_rate = total_blinks / duration_minutes if duration_minutes > 0 else 0
+        analysis += f"• 每分钟眨眼次数：{int(round(blink_rate))}次（共{total_blinks}次）\n"
         analysis += f"• 最高连击：{max_consecutive_hits}次\n"
         analysis += f"• 游戏得分：{game_score}分\n"
         analysis += f"• 游戏模式：{mode_name}\n"

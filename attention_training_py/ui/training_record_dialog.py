@@ -1,16 +1,35 @@
 # ui/training_record_dialog.py
+import math
+import os
+
 from PySide6.QtCore import Qt, QDateTime
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget,
-    QTableWidgetItem, QTabWidget, QWidget, QComboBox, QMessageBox, QHeaderView,
+    QTableWidgetItem, QTabWidget, QWidget, QComboBox, QMessageBox, QFileDialog, QHeaderView,
     QScrollArea
 )
-from PySide6.QtCharts import QChartView, QLineSeries, QChart, QValueAxis
+from PySide6.QtCharts import QChartView, QLineSeries, QChart, QValueAxis, QCategoryAxis
 
 from core.settings import GlobalSettings, DifficultyLevel, TrainingRecord
 from core.user_manager import UserManager, UserRole
 from core.user_session import UserSession
+from core.paths import app_data_dir
+from core.portable_sync import (
+    build_export_payload,
+    is_forbidden_username,
+    load_achievements_file,
+    serialize_payload,
+)
+
+from ui.heatmap_widget import HeatmapWidget
+from ai.composite_scoring import record_composite_score, score_ratio
+from ai.teacher_report_logic import (
+    GAME_MODE_LABELS,
+    blinks_per_minute,
+    composite_improvement,
+    improvement_by_mode,
+)
 
 
 class TrainingRecordDialog(QDialog):
@@ -21,7 +40,10 @@ class TrainingRecordDialog(QDialog):
         self.resize(1000, 700)
 
         self._attention_series = None
+        self._composite_series = None
+        self._composite_tracking_series = None
         self._score_series = None
+        self._score_tracking_series = None
         self._blink_series = None
         self._gaze_score_series = None
         self._gaze_distance_series = None
@@ -31,12 +53,14 @@ class TrainingRecordDialog(QDialog):
         self._tab_widget = None
         self._chart_page = None
         self._attention_chart_view = None
+        self._composite_chart_view = None
         self._score_chart_view = None
         self._blink_chart_view = None
         self._gaze_score_chart_view = None
         self._gaze_distance_chart_view = None
         self._improvement_label = None
         self._trend_label = None
+        self._heatmap_widget = None
 
         self._setup_ui()
         self._setup_chart_page()
@@ -88,11 +112,12 @@ class TrainingRecordDialog(QDialog):
         record_layout.setContentsMargins(5, 5, 5, 5)
 
         self._table = QTableWidget()  # 创建 _table
-        self._table.setColumnCount(9)
+        self._table.setColumnCount(11)
         self._table.setHorizontalHeaderLabels([
             "训练时间", "时长", "游戏模式", "难度",
-            "平均注意力", "眨眼次数", "游戏得分",
-            "注视专注度平均值", "注视偏移距离平均值"
+            "平均注意力", "眨眼次数", "每分钟眨眼次数", "游戏得分",
+            "注视专注度平均值", "注视偏移距离平均值",
+            "综合评分"
         ])
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -114,6 +139,12 @@ class TrainingRecordDialog(QDialog):
 
         btn_layout.addStretch()
         btn_layout.addWidget(clear_btn)
+        export_btn = QPushButton("📤 导出训练数据")
+        export_btn.setFixedSize(150, 40)
+        export_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; border: none; border-radius: 5px; font-size: 14px; font-weight: bold; } QPushButton:hover { background-color: #1976D2; }")
+        export_btn.clicked.connect(self._on_export_data)
+        btn_layout.addWidget(export_btn)
+
         btn_layout.addWidget(close_btn)
         btn_layout.addStretch()
         record_layout.addLayout(btn_layout)
@@ -165,6 +196,31 @@ class TrainingRecordDialog(QDialog):
         card_layout.addLayout(stats_layout)
         scroll_layout.addWidget(summary_card)
 
+        # 专注度热力图
+        heatmap_card = QWidget()
+        heatmap_card.setStyleSheet("background-color: rgba(33, 150, 243, 0.08); border-radius: 12px; padding: 10px;")
+        heatmap_layout = QVBoxLayout(heatmap_card)
+        heatmap_layout.setSpacing(8)
+
+        heatmap_title = QLabel("🔥 专注度热力图")
+        heatmap_title.setStyleSheet("font-size: 16px; font-weight: bold;")
+        heatmap_title.setAlignment(Qt.AlignCenter)
+        heatmap_layout.addWidget(heatmap_title)
+
+        self._heatmap_widget = HeatmapWidget()
+        self._heatmap_widget.setMinimumHeight(300)
+        heatmap_layout.addWidget(self._heatmap_widget)
+
+        heatmap_caption = QLabel(
+            "💡 每一列代表一次训练（从左到右，最早 → 最近），每一行代表一项指标；"
+            "颜色越绿表示该项在自己历史中的表现越好，悬停单元格可查看具体数值。"
+        )
+        heatmap_caption.setWordWrap(True)
+        heatmap_caption.setStyleSheet("font-size: 11px; color: #888888;")
+        heatmap_layout.addWidget(heatmap_caption)
+
+        scroll_layout.addWidget(heatmap_card)
+
         # 创建系列
         self._attention_series = QLineSeries()
         self._attention_series.setName("注意力分数")
@@ -172,12 +228,17 @@ class TrainingRecordDialog(QDialog):
         self._attention_series.setPointsVisible(True)
 
         self._score_series = QLineSeries()
-        self._score_series.setName("游戏得分")
+        self._score_series.setName("游戏得分（找茬）")
         self._score_series.setColor(QColor(33, 150, 243))
         self._score_series.setPointsVisible(True)
 
+        self._score_tracking_series = QLineSeries()
+        self._score_tracking_series.setName("游戏得分（动态追踪）")
+        self._score_tracking_series.setColor(QColor(255, 152, 0))
+        self._score_tracking_series.setPointsVisible(True)
+
         self._blink_series = QLineSeries()
-        self._blink_series.setName("眨眼次数")
+        self._blink_series.setName("每分钟眨眼次数")
         self._blink_series.setColor(QColor(255, 152, 0))
         self._blink_series.setPointsVisible(True)
 
@@ -191,6 +252,16 @@ class TrainingRecordDialog(QDialog):
         self._gaze_distance_series.setColor(QColor(0, 150, 136))
         self._gaze_distance_series.setPointsVisible(True)
 
+        self._composite_series = QLineSeries()
+        self._composite_series.setName("综合评分（找茬）")
+        self._composite_series.setColor(QColor(255, 87, 34))
+        self._composite_series.setPointsVisible(True)
+
+        self._composite_tracking_series = QLineSeries()
+        self._composite_tracking_series.setName("综合评分（动态追踪）")
+        self._composite_tracking_series.setColor(QColor(156, 39, 176))
+        self._composite_tracking_series.setPointsVisible(True)
+
         # 注意力图表
         attention_chart = QChart()
         attention_chart.addSeries(self._attention_series)
@@ -203,10 +274,23 @@ class TrainingRecordDialog(QDialog):
         self._attention_chart_view.setMinimumHeight(250)
         scroll_layout.addWidget(self._attention_chart_view)
 
+        composite_chart = QChart()
+        composite_chart.addSeries(self._composite_series)
+        composite_chart.addSeries(self._composite_tracking_series)
+        composite_chart.setTitle("综合评分趋势（按模式）")
+        composite_chart.setAnimationOptions(QChart.NoAnimation)
+        composite_chart.setBackgroundVisible(False)
+
+        self._composite_chart_view = QChartView(composite_chart)
+        self._composite_chart_view.setRenderHint(QPainter.Antialiasing)
+        self._composite_chart_view.setMinimumHeight(250)
+        scroll_layout.addWidget(self._composite_chart_view)
+
         # 游戏得分图表
         score_chart = QChart()
         score_chart.addSeries(self._score_series)
-        score_chart.setTitle("游戏得分趋势")
+        score_chart.addSeries(self._score_tracking_series)
+        score_chart.setTitle("游戏得分趋势（按模式·0-100）")
         score_chart.setAnimationOptions(QChart.NoAnimation)
         score_chart.setBackgroundVisible(False)
 
@@ -215,10 +299,10 @@ class TrainingRecordDialog(QDialog):
         self._score_chart_view.setMinimumHeight(250)
         scroll_layout.addWidget(self._score_chart_view)
 
-        # 眨眼次数图表
+        # 每分钟眨眼次数图表
         blink_chart = QChart()
         blink_chart.addSeries(self._blink_series)
-        blink_chart.setTitle("眨眼次数趋势")
+        blink_chart.setTitle("每分钟眨眼次数趋势")
         blink_chart.setAnimationOptions(QChart.NoAnimation)
         blink_chart.setBackgroundVisible(False)
 
@@ -254,8 +338,10 @@ class TrainingRecordDialog(QDialog):
         info_label = QLabel(
             "💡 提示：\n"
             "• 图表从左到右显示最早到最近的训练记录\n"
+            "• 综合评分与游戏得分图表按模式分为找茬/动态追踪两条曲线\n"
+            "• 找茬游戏得分按训练期间的比例规则归一为0-100（不含连击加成）\n"
             "• 注意力分数越高表示专注度越好\n"
-            "• 眨眼次数越少通常表示更专注\n"
+            "• 每分钟眨眼次数越少通常表示更专注（正常范围约 10-20 次/分钟）\n"
             "• 注视专注度平均值越高表示视线越集中\n"
             "• 注视偏移距离平均值越小表示视线越贴近屏幕中心"
         )
@@ -354,7 +440,16 @@ class TrainingRecordDialog(QDialog):
             self._table.setItem(i, 4, att_item)
 
             self._table.setItem(i, 5, QTableWidgetItem(str(record.total_blinks)))
-            self._table.setItem(i, 6, QTableWidgetItem(str(record.game_score)))
+            self._table.setItem(
+                i, 6, QTableWidgetItem(str(int(round(blinks_per_minute(record)))))
+            )
+            # 游戏得分统一为 0-100：与图表/热力图一致，找茬按训练期间比例规则
+            # （score_ratio，实际得分/难度基准）归一，不叠加连击分；动态追踪本身即为 0-100。
+            normalized_score = int(round(
+                score_ratio(record.game_score, record.game_mode, record.difficulty,
+                            record.duration_minutes) * 100.0
+            ))
+            self._table.setItem(i, 7, QTableWidgetItem(str(normalized_score)))
 
             gaze_score_item = QTableWidgetItem(str(record.avg_gaze_score))
             if record.avg_gaze_score >= 70:
@@ -363,7 +458,7 @@ class TrainingRecordDialog(QDialog):
                 gaze_score_item.setForeground(QColor(255, 152, 0))
             else:
                 gaze_score_item.setForeground(QColor(244, 67, 54))
-            self._table.setItem(i, 7, gaze_score_item)
+            self._table.setItem(i, 8, gaze_score_item)
 
             gaze_dist_item = QTableWidgetItem(f"{record.avg_gaze_distance:.3f}")
             if record.avg_gaze_distance < 0.15:
@@ -372,44 +467,72 @@ class TrainingRecordDialog(QDialog):
                 gaze_dist_item.setForeground(QColor(255, 152, 0))
             else:
                 gaze_dist_item.setForeground(QColor(244, 67, 54))
-            self._table.setItem(i, 8, gaze_dist_item)
+            self._table.setItem(i, 9, gaze_dist_item)
+
+            composite_item = QTableWidgetItem(str(record_composite_score(record)))
+            cs = record_composite_score(record)
+            if cs >= 80:
+                composite_item.setForeground(QColor(76, 175, 80))
+            elif cs >= 50:
+                composite_item.setForeground(QColor(255, 152, 0))
+            else:
+                composite_item.setForeground(QColor(244, 67, 54))
+            self._table.setItem(i, 10, composite_item)
 
     def _update_charts(self, records: list):
         if not self._attention_series:
             return
 
         # 计算进步
-        improvement = self._calculate_improvement(records)
-        if improvement > 0:
-            self._improvement_label.setText(f"📈 +{int(improvement)}%")
-            self._improvement_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #4CAF50;")
-        elif improvement < 0:
-            self._improvement_label.setText(f"📉 {int(improvement)}%")
-            self._improvement_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #F44336;")
-        else:
-            self._improvement_label.setText("➡️ 0%")
-            self._improvement_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #FF9800;")
+        # 进步：每种模式单独计算（某模式仅一次时按旧约定记为 0%）
+        by_mode = improvement_by_mode(records)
+        mode_parts = []
+        for mode, mode_label in GAME_MODE_LABELS:
+            imp = by_mode.get(mode, 0.0)
+            color = "#4CAF50" if imp > 0 else "#F44336" if imp < 0 else "#FF9800"
+            mode_parts.append(
+                f'<span style="color:{color}; font-weight:bold;">{mode_label} {imp:+.0f}%</span>'
+            )
+        self._improvement_label.setText("　|　".join(mode_parts))
+        self._improvement_label.setStyleSheet("font-size: 22px;")
 
         self._trend_label.setText(self._get_trend_text(records))
 
         # 清除系列数据
         self._attention_series.clear()
         self._score_series.clear()
+        self._score_tracking_series.clear()
         self._blink_series.clear()
         self._gaze_score_series.clear()
         self._gaze_distance_series.clear()
-
-        if not records:
-            return
+        self._composite_series.clear()
+        self._composite_tracking_series.clear()
 
         # 反转数据（最早到最近）
-        chart_records = records[::-1]
+        chart_records = records[::-1] if records else []
+
+        self._update_heatmap(chart_records)
+
+        if not chart_records:
+            return
 
         for i, record in enumerate(chart_records):
             x = i + 1
             self._attention_series.append(x, record.avg_attention_score)
-            self._score_series.append(x, record.game_score)
-            self._blink_series.append(x, record.total_blinks)
+            # 游戏得分统一为 0-100：找茬按训练期间的比例规则（实际得分/难度基准）归一，
+            # 不叠加连击分；动态追踪本身即为 0-100。
+            normalized_score = score_ratio(
+                record.game_score, record.game_mode, record.difficulty,
+                record.duration_minutes,
+            ) * 100.0
+            composite = record_composite_score(record)
+            if record.game_mode == "dynamic_tracking":
+                self._score_tracking_series.append(x, normalized_score)
+                self._composite_tracking_series.append(x, composite)
+            else:
+                self._score_series.append(x, normalized_score)
+                self._composite_series.append(x, composite)
+            self._blink_series.append(x, blinks_per_minute(record))
             self._gaze_score_series.append(x, record.avg_gaze_score)
             self._gaze_distance_series.append(x, record.avg_gaze_distance)
 
@@ -420,34 +543,132 @@ class TrainingRecordDialog(QDialog):
             return
 
         charts = [
-            (self._attention_chart_view, self._attention_series, "注意力分数", 0, 100),
-            (self._score_chart_view, self._score_series, "游戏得分", 0, 1500),
-            (self._blink_chart_view, self._blink_series, "眨眼次数", 0, 30),
-            (self._gaze_score_chart_view, self._gaze_score_series, "注视专注度平均值", 0, 100),
-            (self._gaze_distance_chart_view, self._gaze_distance_series, "注视偏移距离平均值", 0, 1.0)
+            (self._attention_chart_view, [self._attention_series], "注意力分数", 0.0, 100.0, False),
+            (self._composite_chart_view, [self._composite_series, self._composite_tracking_series],
+             "综合评分", 0.0, 100.0, False),
+            (self._score_chart_view, [self._score_series, self._score_tracking_series],
+             "游戏得分（0-100）", 0.0, 100.0, False),
+            (self._blink_chart_view, [self._blink_series], "每分钟眨眼次数", 0.0, None, True),
+            (self._gaze_score_chart_view, [self._gaze_score_series], "注视专注度平均值", 0.0, 100.0, False),
+            (self._gaze_distance_chart_view, [self._gaze_distance_series], "注视偏移距离平均值", 0.0, None, False)
         ]
 
-        for chart_view, series, title, min_val, max_val in charts:
-            if chart_view and chart_view.chart():
-                chart = chart_view.chart()
+        for chart_view, series_list, title, domain_min, domain_max, integer_ticks in charts:
+            if not (chart_view and chart_view.chart()):
+                continue
+            chart = chart_view.chart()
 
-                # 移除旧轴
-                for axis in chart.axes():
-                    chart.removeAxis(axis)
+            # 移除旧轴
+            for axis in chart.axes():
+                chart.removeAxis(axis)
 
-                axis_x = QValueAxis()
-                axis_x.setTitleText("训练次数（最早 → 最近）")
-                axis_x.setRange(0.5, point_count + 0.5)
-                axis_x.setTickCount(min(6, point_count + 1))
+            y_values = [
+                point.y() for series in series_list
+                for point in series.points()
+            ]
+            y_min, y_max, y_step = self._nice_axis_range(y_values, domain_min, domain_max, integer_ticks)
 
-                axis_y = QValueAxis()
-                axis_y.setTitleText(title)
-                axis_y.setRange(min_val, max_val)
+            axis_x = QCategoryAxis()
+            axis_x.setTitleText("训练次数（最早 → 最近）")
+            axis_x.setRange(0.5, point_count + 0.5)
+            axis_x.setLabelsPosition(QCategoryAxis.AxisLabelsPositionOnValue)
+            label_step = max(1, math.ceil(point_count / 10))
+            for i in range(1, point_count + 1, label_step):
+                axis_x.append(str(i), float(i))
+            axis_x.setGridLineVisible(False)
 
-                chart.addAxis(axis_x, Qt.AlignBottom)
-                chart.addAxis(axis_y, Qt.AlignLeft)
+            axis_y = QValueAxis()
+            axis_y.setTitleText(title)
+            axis_y.setRange(y_min, y_max)
+            axis_y.setTickCount(int(round((y_max - y_min) / y_step)) + 1)
+            if y_step >= 1:
+                axis_y.setLabelFormat("%d")
+            elif y_step >= 0.1:
+                axis_y.setLabelFormat("%.1f")
+            else:
+                axis_y.setLabelFormat("%.2f")
+
+            chart.addAxis(axis_x, Qt.AlignBottom)
+            chart.addAxis(axis_y, Qt.AlignLeft)
+            for series in series_list:
                 series.attachAxis(axis_x)
                 series.attachAxis(axis_y)
+
+    def _update_heatmap(self, chart_records: list):
+        """填充专注度热力图：行 = 指标，列 = 训练次数。"""
+        if self._heatmap_widget is None:
+            return
+
+        if not chart_records:
+            self._heatmap_widget.set_data([], [])
+            return
+
+        rows = [
+            ("平均注意力", [r.avg_attention_score for r in chart_records], True),
+            ("注视专注度", [r.avg_gaze_score for r in chart_records], True),
+            # 游戏得分统一为 0-100：找茬/动态追踪均按训练期间的比例规则
+            # （score_ratio，实际得分/难度基准或 /100）归一，不叠加连击分。
+            ("游戏得分（0-100）", [
+                score_ratio(r.game_score, r.game_mode, r.difficulty,
+                            r.duration_minutes) * 100.0
+                for r in chart_records
+            ], True),
+            ("每分钟眨眼次数", [blinks_per_minute(r) for r in chart_records], False),
+            ("注视偏移距离", [r.avg_gaze_distance for r in chart_records], False),
+            ("综合评分", [record_composite_score(r) for r in chart_records], True),
+        ]
+        labels = [
+            r.date_time.toString("MM-dd") if r.date_time else f"第{i + 1}次"
+            for i, r in enumerate(chart_records)
+        ]
+        self._heatmap_widget.set_data(rows, labels)
+
+    @staticmethod
+    def _nice_axis_range(values, domain_min=None, domain_max=None, integer_ticks=False):
+        """根据数据范围计算美观的自适应坐标轴范围与刻度步长。
+
+        刻度目标密度约为 7 档，步长按 1/2/5 x 10^n 自适应取整；
+        顶部不做硬性截断：当数据贴近（或达到）100 等上限时，
+        坐标轴自动向外扩展一个刻度，为曲线和刻度标签预留空间。
+        """
+        if not values:
+            low, high = 0.0, 1.0
+        else:
+            data_min = float(min(values))
+            data_max = float(max(values))
+            span = data_max - data_min
+            if span > 0:
+                pad = span * 0.10
+            else:
+                pad = max(abs(data_min) * 0.1, 1.0)
+            low = data_min - pad
+            high = data_max + pad
+
+        # 下限不越过自然定义域（百分比/次数等不能为负）
+        if domain_min is not None:
+            low = max(low, domain_min)
+        if high <= low:
+            high = low + 1.0
+
+        raw_step = (high - low) / 7.0
+        magnitude = 10 ** math.floor(math.log10(raw_step))
+        step = magnitude
+        for nice in (1, 2, 5, 10):
+            candidate = nice * magnitude
+            if raw_step <= candidate + 1e-9:
+                step = candidate
+                break
+        if integer_ticks and step < 1:
+            step = 1.0
+
+        low = math.floor(low / step) * step
+        high = math.ceil(high / step) * step
+
+        # 数据最大值不应顶在坐标轴边界上：至少留出半个刻度的空间
+        if values and float(max(values)) >= high - step * 0.5:
+            high += step
+
+        return low, high, step
 
     def _calculate_improvement(self, records: list) -> float:
         if len(records) < 2:
@@ -459,8 +680,8 @@ class TrainingRecordDialog(QDialog):
         elif len(records) >= 4:
             compare_count = 2
 
-        recent_sum = sum(r.avg_attention_score for r in records[:compare_count])
-        early_sum = sum(r.avg_attention_score for r in records[-compare_count:])
+        recent_sum = sum(record_composite_score(r) for r in records[:compare_count])
+        early_sum = sum(record_composite_score(r) for r in records[-compare_count:])
 
         recent_avg = recent_sum // compare_count
         early_avg = early_sum // compare_count
@@ -470,36 +691,109 @@ class TrainingRecordDialog(QDialog):
 
         return max(-100.0, min(100.0, ((recent_avg - early_avg) / early_avg) * 100.0))
 
+    @staticmethod
+    def _mode_of(record) -> str:
+        """未知/空模式按找茬处理（与 score_ratio 归一语义一致）。"""
+        mode = getattr(record, "game_mode", "")
+        return mode if mode == "dynamic_tracking" else "find_difference"
+
     def _get_trend_text(self, records: list) -> str:
-        if len(records) < 2:
-            return "完成更多训练后\n将显示进步趋势"
+        lines = []
+        for mode, mode_label in GAME_MODE_LABELS:
+            mode_records = [r for r in records if self._mode_of(r) == mode]
+            if len(mode_records) < 2:
+                # 仅一次：按旧约定不展示进步趋势
+                lines.append(f"{mode_label}模式：完成更多训练后将显示进步趋势")
+                continue
 
-        improvement = self._calculate_improvement(records)
+            compare_count = 1
+            if len(mode_records) >= 6:
+                compare_count = 3
+            elif len(mode_records) >= 4:
+                compare_count = 2
 
-        compare_count = 1
-        if len(records) >= 6:
-            compare_count = 3
-        elif len(records) >= 4:
-            compare_count = 2
+            recent_avg = (
+                sum(record_composite_score(r) for r in mode_records[:compare_count])
+                // compare_count
+            )
+            early_avg = (
+                sum(record_composite_score(r) for r in mode_records[-compare_count:])
+                // compare_count
+            )
+            improvement = composite_improvement(mode_records)
 
-        recent_avg = sum(r.avg_attention_score for r in records[:compare_count]) // compare_count
-        early_avg = sum(r.avg_attention_score for r in records[-compare_count:]) // compare_count
+            if improvement > 0:
+                lines.append(
+                    f"{mode_label}模式：综合分数从{early_avg}提升到{recent_avg}，"
+                    f"提升了{int(improvement)}%"
+                )
+            elif improvement < 0:
+                lines.append(
+                    f"{mode_label}模式：综合分数从{early_avg}降至{recent_avg}，"
+                    f"下降{int(-improvement)}%"
+                )
+            else:
+                lines.append(f"{mode_label}模式：综合分数保持{recent_avg}，基本持平")
+        return "\n".join(lines)
 
-        if improvement > 20:
-            return f"🚀 进步显著！\n注意力从{early_avg}提升到{recent_avg}\n提升了{int(improvement)}%"
-        elif improvement > 10:
-            return f"📈 持续进步！\n注意力从{early_avg}提升到{recent_avg}\n提升了{int(improvement)}%"
-        elif improvement > 5:
-            return f"✨ 稳步提升\n注意力从{early_avg}提升到{recent_avg}\n提升了{int(improvement)}%"
-        elif improvement > 0:
-            return f"🌱 略有进步\n注意力从{early_avg}到{recent_avg}\n提升{int(improvement)}%"
-        elif improvement > -5:
-            return f"⚖️ 保持稳定\n注意力从{early_avg}到{recent_avg}\n基本持平"
-        elif improvement > -10:
-            return f"📉 有所下降\n注意力从{early_avg}降至{recent_avg}\n下降{int(-improvement)}%"
+    def _on_export_data(self):
+        user_manager = UserManager()
+        if self._student_selector is not None:
+            username = self._selected_student_username
+            user = user_manager.get_user(username) if username else None
         else:
-            return f"⚠️ 需要加油\n注意力从{early_avg}降至{recent_avg}\n下降{int(-improvement)}%"
+            username = GlobalSettings().current_user()
+            user = user_manager.get_user(username)
 
+        if is_forbidden_username(username):
+            QMessageBox.warning(self, "禁止导出", "默认用户/空用户名的数据不允许导出")
+            return
+
+        display_name = user.display_name if user else username
+        role = user.role.value if user else "student"
+        teacher_id = user.teacher_id if user else ""
+
+        records = [
+            r.to_dict()
+            for r in GlobalSettings().training_records_for_user(username)
+        ]
+        achievements = load_achievements_file(
+            os.path.join(app_data_dir(), "users", username, "achievements.json")
+        )
+
+        payload = build_export_payload(
+            username=username,
+            display_name=display_name,
+            role=role,
+            teacher_id=teacher_id,
+            records=records,
+            achievements=achievements,
+        )
+
+        default_name = (
+            f"训练数据_{username}_"
+            f"{QDateTime.currentDateTime().toString('yyyyMMdd')}.json"
+        )
+        file_name = QFileDialog.getSaveFileName(
+            self, "导出训练数据", default_name, "训练数据文件 (*.json);;所有文件 (*)"
+        )[0]
+        if not file_name:
+            return
+
+        try:
+            with open(file_name, "w", encoding="utf-8") as f:
+                f.write(serialize_payload(payload))
+        except OSError as e:
+            QMessageBox.warning(self, "导出失败", f"无法写入文件:\n{e}")
+            return
+
+        QMessageBox.information(
+            self,
+            "导出成功",
+            f"已导出 {len(records)} 条训练记录。\n"
+            f"文件: {file_name}\n"
+            f"请在教师端「班级报告」中点击「导入学生数据」。",
+        )
     def _on_clear_records(self):
         settings = GlobalSettings()
         if self._student_selector is not None:
@@ -537,7 +831,8 @@ class TrainingRecordDialog(QDialog):
                 self._update_table([])
                 self._update_charts([])
         else:
-            records = GlobalSettings().training_records()
+            settings = GlobalSettings()
+            records = settings.training_records_for_user(settings.current_user())
             self._update_table(records)
             self._update_charts(records)
 
@@ -568,3 +863,6 @@ class TrainingRecordDialog(QDialog):
             QComboBox::drop-down {{ border: none; }}
             QComboBox QAbstractItemView {{ background-color: {table_bg}; color: {text}; }}
         """)
+
+        if self._heatmap_widget is not None:
+            self._heatmap_widget.set_theme(night_mode, QColor(text))

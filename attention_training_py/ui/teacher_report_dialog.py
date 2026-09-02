@@ -15,7 +15,19 @@ from core.user_manager import UserManager, UserRole
 from core.settings import GlobalSettings, TrainingRecord
 from core.user_session import UserSession
 from core.paths import app_data_dir
+from core.database import Database
+from core.portable_sync import (
+    apply_import,
+    deserialize_payload,
+    is_forbidden_username,
+    load_achievements_file,
+    merge_achievements,
+    save_achievements_file,
+)
+
 from ai.teacher_report_logic import (
+    GAME_MODE_LABELS,
+    blinks_per_minute,
     composite_improvement,
     compute_class_stats,
     compute_class_summaries,
@@ -78,7 +90,9 @@ class TeacherReportDialog(QDialog):
         self._export_btn = QPushButton("📎 导出CSV")
         self._export_btn.setFixedSize(120, 38)
         self._export_btn.clicked.connect(self._export_to_csv)
-
+        self._import_btn = QPushButton("📥 导入学生数据")
+        self._import_btn.setFixedSize(120, 38)
+        self._import_btn.clicked.connect(self._on_import_data)
         self._class_report_btn = QPushButton("📈 生成班级报告")
         self._class_report_btn.setFixedSize(140, 38)
         self._class_report_btn.clicked.connect(self._on_generate_class_report)
@@ -91,6 +105,7 @@ class TeacherReportDialog(QDialog):
         control_layout.addStretch()
         control_layout.addWidget(self._refresh_btn)
         control_layout.addWidget(self._export_btn)
+        control_layout.addWidget(self._import_btn)
         control_layout.addWidget(self._class_report_btn)
         control_layout.addWidget(self._coach_btn)
         main_layout.addLayout(control_layout)
@@ -130,6 +145,10 @@ class TeacherReportDialog(QDialog):
         ])
         self._student_table.horizontalHeader().setStretchLastSection(True)
         self._student_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        # 合理分配列宽：进步趋势（含两种模式）最宽，数值类窄列不挤压文字
+        column_widths = [120, 75, 90, 90, 90, 120, 70, 240, 110, 100]
+        for col, width in enumerate(column_widths):
+            self._student_table.setColumnWidth(col, width)
         self._student_table.setSelectionBehavior(QTableWidget.SelectRows)
         self._student_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._student_table.setAlternatingRowColors(True)
@@ -163,9 +182,10 @@ class TeacherReportDialog(QDialog):
         detail_layout.addLayout(detail_header_layout)
 
         self._detail_table = QTableWidget()
-        self._detail_table.setColumnCount(6)
+        self._detail_table.setColumnCount(7)
         self._detail_table.setHorizontalHeaderLabels([
-            "训练时间", "时长", "游戏模式", "注意力分数", "眨眼次数", "游戏得分(0-100)"
+            "训练时间", "时长", "游戏模式", "注意力分数",
+            "眨眼次数", "每分钟眨眼次数", "游戏得分(0-100)"
         ])
         self._detail_table.horizontalHeader().setStretchLastSection(True)
         self._detail_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -289,15 +309,21 @@ class TeacherReportDialog(QDialog):
             self._student_table.setItem(i, 5, QTableWidgetItem(str(summary['avg_game_score'])))
             self._student_table.setItem(i, 6, QTableWidgetItem(str(summary['achievements'])))
 
-            trend_text = "➡️ 0%"
-            if summary['improvement'] > 0:
-                trend_text = f"📈 +{int(summary['improvement'])}%"
-            elif summary['improvement'] < 0:
-                trend_text = f"📉 {int(summary['improvement'])}%"
+            by_mode = summary.get('improvement_by_mode') or {}
+            mode_parts = []
+            for mode, mode_label in GAME_MODE_LABELS:
+                imp = float(by_mode.get(mode, 0.0) or 0.0)
+                if imp > 0:
+                    mode_parts.append(f"{mode_label} +{int(imp)}%")
+                elif imp < 0:
+                    mode_parts.append(f"{mode_label} {int(imp)}%")
+                else:
+                    mode_parts.append(f"{mode_label} 0%")
+            trend_text = " | ".join(mode_parts)
             trend_item = QTableWidgetItem(trend_text)
-            if summary['improvement'] > 0:
+            if any(float(by_mode.get(m, 0.0) or 0.0) > 0 for m, _ in GAME_MODE_LABELS):
                 trend_item.setForeground(QColor(76, 175, 80))
-            elif summary['improvement'] < 0:
+            elif any(float(by_mode.get(m, 0.0) or 0.0) < 0 for m, _ in GAME_MODE_LABELS):
                 trend_item.setForeground(QColor(244, 67, 54))
             self._student_table.setItem(i, 7, trend_item)
             self._student_table.setItem(i, 8, QTableWidgetItem(summary['last_training']))
@@ -316,7 +342,15 @@ class TeacherReportDialog(QDialog):
         self._total_hours_label.setText(format_duration(stats['total_minutes']))
         top = stats['top_improvement_student']
         if top:
-            self._top_student_label.setText(f"{top['display_name']} (+{int(top['improvement'])}%)")
+            top_mode = stats.get('top_improvement_mode')
+            mode_label = dict(GAME_MODE_LABELS).get(top_mode, "")
+            by_mode = top.get('improvement_by_mode') or {}
+            top_imp = float(by_mode.get(top_mode, 0.0) or 0.0) if top_mode else float(top.get('improvement', 0.0) or 0.0)
+            if mode_label:
+                label = f"{top['display_name']}（{mode_label} +{int(top_imp)}%）"
+            else:
+                label = f"{top['display_name']} (+{int(top_imp)}%)"
+            self._top_student_label.setText(label)
         else:
             self._top_student_label.setText("暂无数据")
 
@@ -394,12 +428,16 @@ class TeacherReportDialog(QDialog):
             self._detail_table.setItem(i, 4, QTableWidgetItem(str(record.total_blinks)))
             self._detail_table.setItem(
                 i, 5,
+                QTableWidgetItem(str(int(round(blinks_per_minute(record))))),
+            )
+            self._detail_table.setItem(
+                i, 6,
                 QTableWidgetItem(str(int(round(self._normalized_game_score(record))))),
             )
 
         if not filtered_records:
             self._detail_table.setRowCount(1)
-            self._detail_table.setSpan(0, 0, 1, 6)
+            self._detail_table.setSpan(0, 0, 1, 7)
             empty_item = QTableWidgetItem("空")
             empty_item.setTextAlignment(Qt.AlignCenter)
             self._detail_table.setItem(0, 0, empty_item)
@@ -482,6 +520,55 @@ class TeacherReportDialog(QDialog):
         )
         dlg.exec()
 
+
+    def _on_import_data(self):
+        file_name = QFileDialog.getOpenFileName(
+            self, "导入学生数据", "", "训练数据文件 (*.json);;所有文件 (*)"
+        )[0]
+        if not file_name:
+            return
+
+        try:
+            with open(file_name, "r", encoding="utf-8") as f:
+                payload = deserialize_payload(f.read())
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, "导入失败", f"无法读取训练数据文件:\n{e}")
+            return
+
+        user_manager = UserManager()
+        role = user_manager.current_user_role()
+        teacher_id = (
+            user_manager.current_username() if role == UserRole.TEACHER else ""
+        )
+
+        try:
+            summary = apply_import(Database(), payload, teacher_id=teacher_id)
+            username = payload["user"]["username"]
+        except (ValueError, KeyError, TypeError) as e:
+            QMessageBox.warning(self, "导入失败", f"文件内容无效:\n{e}")
+            return
+
+        achievements_dir = os.path.join(app_data_dir(), "users", username)
+        achievements_path = os.path.join(achievements_dir, "achievements.json")
+        existing_achievements = load_achievements_file(achievements_path)
+        merged_achievements = merge_achievements(
+            existing_achievements, payload.get("achievements") or {}
+        )
+        save_achievements_file(achievements_path, merged_achievements)
+
+        user_manager.reload_users()
+        self._refresh_report()
+
+        created = "（新学生账号已创建）" if summary.user_created else ""
+        QMessageBox.information(
+            self,
+            "导入完成",
+            f"学生: {payload['user'].get('display_name') or username} {created}\n"
+            f"新增训练记录: {summary.records_added} 条\n"
+            f"跳过重复记录: {summary.records_skipped} 条\n"
+            f"忽略无效/默认用户记录: {summary.records_ignored} 条\n"
+            f"成就数据已合并。",
+        )
     def _export_to_csv(self):
         file_name = QFileDialog.getSaveFileName(
             self, "导出班级报告",
@@ -498,7 +585,6 @@ class TeacherReportDialog(QDialog):
             return
 
         stream = QTextStream(file)
-        stream.setEncoding(QTextStream.Utf8)
 
         # 写入头部
         stream << "========== 班级训练报告 ==========\n"
@@ -506,7 +592,7 @@ class TeacherReportDialog(QDialog):
         stream << f"总学生数: {len(self._summaries)}人\n\n"
 
         # 写入数据
-        stream << "学生姓名,训练次数,总时长(分钟),平均注意力,最高注意力,平均得分(0-100),成就数,进步趋势,平均综合分,最近训练时间\n"
+        stream << "学生姓名,训练次数,总时长(分钟),平均注意力,最高注意力,平均得分(0-100),成就数,进步趋势(找茬/动态追踪),平均综合分,最近训练时间\n"
 
         for summary in self._summaries:
             stream << f"{summary['display_name']},"
@@ -516,7 +602,11 @@ class TeacherReportDialog(QDialog):
             stream << f"{summary['max_attention']},"
             stream << f"{summary['avg_game_score']},"
             stream << f"{summary['achievements']},"
-            stream << f"{summary['improvement']:.1f}%,"
+            by_mode = summary.get('improvement_by_mode') or {}
+            stream << (
+                f"找茬{float(by_mode.get('find_difference', 0.0) or 0.0):+.1f}%/"
+                f"追踪{float(by_mode.get('dynamic_tracking', 0.0) or 0.0):+.1f}%,"
+            )
             stream << f"{summary['avg_composite']},"
             stream << f"{summary['last_training']}\n"
 
@@ -537,8 +627,11 @@ class TeacherReportDialog(QDialog):
         total_composite = sum(s['avg_composite'] for s in self._summaries)
         total_achievements = sum(s['achievements'] for s in self._summaries)
 
-        improving = sum(1 for s in self._summaries if s['improvement'] > 5)
-        declining = sum(1 for s in self._summaries if s['improvement'] < -5)
+        class_stats = compute_class_stats(self._summaries)
+        improving = class_stats['improving']
+        declining = class_stats['declining']
+        improving_by_mode = class_stats['improving_by_mode']
+        declining_by_mode = class_stats['declining_by_mode']
 
         best = max(self._summaries, key=lambda s: s['avg_composite'])
         worst = min(self._summaries, key=lambda s: s['avg_composite'])
@@ -569,7 +662,10 @@ class TeacherReportDialog(QDialog):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   📈 进步学生: {improving} 人 ({improving / total_students * 100:.0f}%)
   📉 退步学生: {declining} 人 ({declining / total_students * 100:.0f}%)
-  ➡️ 稳定学生: {total_students - improving - declining} 人
+  ➡️ 稳定学生: {max(0, total_students - improving - declining)} 人
+
+  🎮 找茬模式: 进步 {improving_by_mode['find_difference']} 人 / 退步 {declining_by_mode['find_difference']} 人
+  🎯 动态追踪模式: 进步 {improving_by_mode['dynamic_tracking']} 人 / 退步 {declining_by_mode['dynamic_tracking']} 人
 
   🏅 最佳表现: {best['display_name']} (综合分 {best['avg_composite']})
   📝 需要关注: {worst['display_name']} (综合分 {worst['avg_composite']})

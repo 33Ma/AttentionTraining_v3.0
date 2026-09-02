@@ -159,6 +159,10 @@ class UserManager(QObject):
         except Exception as e:
             print(f"Error saving users: {e}")
 
+
+    def reload_users(self):
+        """重新从数据库加载用户列表（导入学生数据后调用）。"""
+        self._load_users()
     def login(self, username: str, password: str) -> bool:
         if username not in self._users:
             return False

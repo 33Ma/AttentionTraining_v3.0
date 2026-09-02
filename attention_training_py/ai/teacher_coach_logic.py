@@ -6,7 +6,7 @@
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from .teacher_report_logic import format_duration
+from .teacher_report_logic import GAME_MODE_LABELS, format_duration
 
 TEACHER_SYSTEM_PROMPT = (
     "你是\"游戏化注意力训练系统\"的班级教学助手（AI助教），服务的对象是班级教师。"
@@ -60,7 +60,7 @@ def format_class_context(
         lines.append(
             f"- {s['display_name']}：训练{s['total_trainings']}次，"
             f"平均注意力{s['avg_attention']}，综合分{s['avg_composite']}，"
-            f"进步{s['improvement']:+.0f}%，最近训练{s['last_training']}"
+            f"进步{_format_improvement(s)}，最近训练{s['last_training']}"
         )
     return "\n".join(lines)
 
@@ -123,6 +123,30 @@ def _match_student(
     return None
 
 
+def _format_improvement(student: Dict[str, Any]) -> str:
+    """按模式格式化进步值：找茬+x%/动态追踪-y%。"""
+    by_mode = student.get("improvement_by_mode") or {}
+    parts = []
+    for mode, mode_label in GAME_MODE_LABELS:
+        imp = float(by_mode.get(mode, 0.0) or 0.0)
+        parts.append(f"{mode_label}{imp:+.0f}%")
+    return "、".join(parts)
+
+
+def _best_improvement(student: Dict[str, Any]) -> float:
+    by_mode = student.get("improvement_by_mode")
+    if by_mode:
+        return max(float(v or 0.0) for v in by_mode.values())
+    return float(student.get("improvement", 0.0) or 0.0)
+
+
+def _worst_improvement(student: Dict[str, Any]) -> float:
+    by_mode = student.get("improvement_by_mode")
+    if by_mode:
+        return min(float(v or 0.0) for v in by_mode.values())
+    return float(student.get("improvement", 0.0) or 0.0)
+
+
 def _class_report(summaries, stats) -> str:
     total_students = stats.get("total_students", 0)
     total_trainings = stats.get("total_trainings", 0)
@@ -131,6 +155,8 @@ def _class_report(summaries, stats) -> str:
     class_composite = stats.get("class_avg_composite", 0)
     improving = stats.get("improving", 0)
     declining = stats.get("declining", 0)
+    imp_by_mode = stats.get("improving_by_mode") or {}
+    dec_by_mode = stats.get("declining_by_mode") or {}
     best = stats.get("best")
     worst = stats.get("worst")
 
@@ -141,6 +167,10 @@ def _class_report(summaries, stats) -> str:
         f"📈 班级平均注意力 {class_avg} 分，平均综合分 {class_composite} 分；",
         f"✅ 进步学生 {improving} 人，⚠️ 退步学生 {declining} 人，"
         f"稳定 {stats.get('stable', 0)} 人。",
+        f"🎮 找茬模式：进步 {imp_by_mode.get('find_difference', 0)} 人 / "
+        f"退步 {dec_by_mode.get('find_difference', 0)} 人；",
+        f"🎯 动态追踪模式：进步 {imp_by_mode.get('dynamic_tracking', 0)} 人 / "
+        f"退步 {dec_by_mode.get('dynamic_tracking', 0)} 人。",
     ]
     if best:
         lines.append(f"🏆 最佳表现：{best['display_name']}（综合分 {best['avg_composite']}）")
@@ -164,13 +194,14 @@ def _class_report(summaries, stats) -> str:
 
 def _student_reply(student: Dict[str, Any]) -> str:
     composite = student.get("avg_composite", 0)
-    imp = student.get("improvement", 0.0)
+    best_imp = _best_improvement(student)
+    worst_imp = _worst_improvement(student)
     lines = [
         f"🤖 {student.get('display_name', '该学生')} 的情况：",
         f"• 训练 {student.get('total_trainings', 0)} 次，"
         f"总时长 {format_duration(student.get('total_minutes', 0))}",
         f"• 平均注意力 {student.get('avg_attention', 0)}，综合分 {composite}",
-        f"• 进步幅度 {imp:+.0f}%，最近训练 {student.get('last_training', '无')}",
+        f"• 进步：{_format_improvement(student)}，最近训练 {student.get('last_training', '无')}",
     ]
     if composite >= 80:
         lines.append("✅ 表现突出，可以尝试更高难度训练保持挑战。")
@@ -178,9 +209,9 @@ def _student_reply(student: Dict[str, Any]) -> str:
         lines.append("📈 表现良好，建议保持训练频率，重点巩固薄弱环节。")
     else:
         lines.append("⚠️ 综合分偏低，建议增加训练频率并配合教师/家长陪伴练习。")
-    if imp < -5:
-        lines.append("📉 近期有所退步，建议关注其训练状态和作息，适当降低难度重建信心。")
-    elif imp > 5:
+    if worst_imp < -5:
+        lines.append("📉 某模式近期有所退步，建议关注其训练状态和作息，适当降低难度重建信心。")
+    elif best_imp > 5:
         lines.append("🌟 近期进步明显，继续保持！")
     return "\n".join(lines)
 
@@ -189,7 +220,7 @@ def _risk_reply(summaries, stats) -> str:
     flagged = [
         s for s in summaries
         if s.get("total_trainings", 0) > 0
-        and (s.get("improvement", 0.0) < -5 or s.get("avg_composite", 0) < 50)
+        and (_worst_improvement(s) < -5 or s.get("avg_composite", 0) < 50)
     ]
     if not flagged:
         return "🤖 目前没有发现需要重点关注的学生，班级整体状态良好。"
@@ -197,7 +228,7 @@ def _risk_reply(summaries, stats) -> str:
     for s in flagged:
         lines.append(
             f"• {s['display_name']}：综合分 {s.get('avg_composite', 0)}，"
-            f"进步 {s.get('improvement', 0.0):+.0f}%，训练 {s.get('total_trainings', 0)} 次"
+            f"进步 {_format_improvement(s)}，训练 {s.get('total_trainings', 0)} 次"
         )
     lines.append("建议：了解原因（训练频率/作息/兴趣），降低难度重建信心，必要时单独沟通鼓励。")
     return "\n".join(lines)

@@ -25,7 +25,7 @@ class UserSession(QObject):
         super().__init__()
         self._initialized = True
 
-        self._current_user = "默认用户"
+        self._current_user = ""
         self._previous_user = ""
         self._training_active = False
         self._user_locks = {}
@@ -37,11 +37,28 @@ class UserSession(QObject):
         user_manager.user_logged_in.connect(self._on_user_logged_in)
         user_manager.user_logged_out.connect(self._on_user_logged_out)
 
+        # 会话可能在登录完成之后才被首次实例化（例如点击“开始训练”时），
+        # 此时登录信号已经错过，需同步当前已登录用户；
+        # 否则训练数据会被错误地归属到未登录的空用户。
+        if user_manager.is_logged_in():
+            self._current_user = user_manager.current_username()
+
     def _on_user_logged_in(self, username: str, role):
         self.switch_user(username)
 
     def _on_user_logged_out(self):
-        self.switch_user("默认用户")
+        """登出：清空会话用户，不再回退到“默认用户”。"""
+        old_user = self._current_user
+        if not old_user:
+            return
+        self._previous_user = old_user
+        self._current_user = ""
+        try:
+            GlobalSettings().set_current_user("")
+        except Exception as e:
+            print(f"UserSession: Failed to clear GlobalSettings user: {e}")
+        self._unlock_user_data(old_user)
+        self.user_switched.emit(old_user, "")
 
     def switch_user(self, username: str) -> bool:
         if self._training_active:

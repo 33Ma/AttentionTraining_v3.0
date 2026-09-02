@@ -9,7 +9,7 @@ def main():
 
     try:
         print("Creating training window...")
-        window = TrainingWindow(1, "tracking")  # 1分钟，追踪模式
+        window = TrainingWindow(1, "dynamic_tracking")  # 1分钟，追踪模式
         print("Training window created successfully")
         window.show()
         print("Window shown")

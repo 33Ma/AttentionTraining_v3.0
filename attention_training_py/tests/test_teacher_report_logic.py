@@ -6,12 +6,14 @@ import unittest
 from core.settings import TrainingRecord, DifficultyLevel
 from ui.teacher_report_dialog import TeacherReportDialog
 from ai.teacher_report_logic import (
+    blinks_per_minute,
     composite_improvement,
     compute_class_stats,
     compute_class_summaries,
     compute_student_summary,
     filter_records,
     format_duration,
+    improvement_by_mode,
     normalized_game_score,
 )
 
@@ -28,12 +30,27 @@ def _record(mode: str, score: int, difficulty: str, composite: int,
 
 
 class TeacherReportLogicTests(unittest.TestCase):
+    def test_blinks_per_minute(self):
+        r = TrainingRecord()
+        r.total_blinks = 150
+        r.duration_minutes = 5
+        self.assertEqual(blinks_per_minute(r), 30.0)
+        # 时长缺失/为 0 时返回 0（旧记录兼容）
+        r2 = TrainingRecord()
+        r2.total_blinks = 40
+        r2.duration_minutes = 0
+        self.assertEqual(blinks_per_minute(r2), 0.0)
+        # dict 记录
+        self.assertEqual(
+            blinks_per_minute({"total_blinks": 40, "duration_minutes": 10}), 4.0
+        )
+
     def test_normalized_game_score_maps_find_to_0_100(self):
         norm = TeacherReportDialog._normalized_game_score
-        # 找茬：实际得分 / 难度基准（普通 580）
-        self.assertAlmostEqual(norm(_record("find_difference", 290, "normal", 70)), 50.0)
-        self.assertAlmostEqual(norm(_record("find_difference", 580, "normal", 90)), 100.0)
-        self.assertAlmostEqual(norm(_record("find_difference", 600, "easy", 90)), 100.0)
+        # 找茬：实际得分 / 难度基准（普通 900，路线 B 上调）
+        self.assertAlmostEqual(norm(_record("find_difference", 450, "normal", 70)), 50.0)
+        self.assertAlmostEqual(norm(_record("find_difference", 900, "normal", 90)), 100.0)
+        self.assertAlmostEqual(norm(_record("find_difference", 950, "easy", 90)), 100.0)
         # 动态追踪：本身就是 0-100，超限截断
         self.assertAlmostEqual(norm(_record("dynamic_tracking", 80, "hard", 65)), 80.0)
         self.assertAlmostEqual(norm(_record("dynamic_tracking", 150, "hard", 65)), 100.0)
@@ -145,6 +162,65 @@ class TeacherReportModuleTests(unittest.TestCase):
         self.assertEqual(format_duration(45), "45分钟")
         self.assertEqual(format_duration(60), "1小时")
         self.assertEqual(format_duration(75), "1小时15分钟")
+    def test_improvement_by_mode_splits_modes(self):
+        records = [
+            _record("find_difference", 300, "normal", 70),
+            _record("find_difference", 200, "normal", 30),
+            _record("dynamic_tracking", 80, "hard", 40),
+            _record("dynamic_tracking", 60, "hard", 30),
+        ]
+        by_mode = improvement_by_mode(records)
+        self.assertAlmostEqual(by_mode["find_difference"], 100.0)
+        self.assertAlmostEqual(by_mode["dynamic_tracking"], (40 - 30) / 30 * 100.0)
+
+    def test_improvement_by_mode_single_session_is_zero(self):
+        records = [
+            _record("find_difference", 300, "normal", 70),
+            _record("dynamic_tracking", 80, "hard", 40),
+        ]
+        by_mode = improvement_by_mode(records)
+        self.assertEqual(by_mode["find_difference"], 0.0)
+        self.assertEqual(by_mode["dynamic_tracking"], 0.0)
+
+    def test_student_summary_includes_improvement_by_mode(self):
+        records = [
+            _dict_record("2026-08-26 10:30:00", composite=80),
+            _dict_record("2026-08-20 09:00:00", composite=60),
+            _dict_record("2026-08-25 10:00:00", mode="dynamic_tracking", composite=40),
+        ]
+        s = compute_student_summary("stu1", "小明", records)
+        self.assertGreater(s["improvement_by_mode"]["find_difference"], 0)
+        self.assertEqual(s["improvement_by_mode"]["dynamic_tracking"], 0.0)
+        self.assertEqual(s["trainings_by_mode"]["find_difference"], 2)
+        self.assertEqual(s["trainings_by_mode"]["dynamic_tracking"], 1)
+
+    def test_class_stats_per_mode_and_top_student(self):
+        find_records = [
+            _dict_record("2026-08-26 10:30:00", composite=75),
+            _dict_record("2026-08-24 10:30:00", composite=60),
+            _dict_record("2026-08-22 10:30:00", composite=45),
+        ]
+        track_flat = [
+            _dict_record("2026-08-26 09:00:00", mode="dynamic_tracking", composite=50),
+            _dict_record("2026-08-25 09:00:00", mode="dynamic_tracking", composite=50),
+            _dict_record("2026-08-24 09:00:00", mode="dynamic_tracking", composite=50),
+        ]
+        track_declining = [
+            _dict_record("2026-08-26 09:00:00", mode="dynamic_tracking", composite=35),
+            _dict_record("2026-08-25 09:00:00", mode="dynamic_tracking", composite=40),
+            _dict_record("2026-08-24 09:00:00", mode="dynamic_tracking", composite=45),
+        ]
+        s1 = compute_student_summary("s1", "学生1", find_records + track_flat)
+        s2 = compute_student_summary("s2", "学生2", track_declining)
+        stats = compute_class_stats([s1, s2])
+        self.assertEqual(stats["improving"], 1)
+        self.assertEqual(stats["declining"], 1)
+        self.assertEqual(stats["improving_by_mode"]["find_difference"], 1)
+        self.assertEqual(stats["improving_by_mode"]["dynamic_tracking"], 0)
+        self.assertEqual(stats["declining_by_mode"]["find_difference"], 0)
+        self.assertEqual(stats["declining_by_mode"]["dynamic_tracking"], 1)
+        self.assertEqual(stats["top_improvement_student"]["name"], "s1")
+        self.assertEqual(stats["top_improvement_mode"], "find_difference")
 
 
 if __name__ == "__main__":

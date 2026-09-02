@@ -472,6 +472,7 @@ self._ensure_column(conn, "training_records", "new_field", "INTEGER NOT NULL DEF
 | 摄像头无法打开 | 检查是否被其他程序占用，确认系统权限 |
 | 帧率过低 | 降低摄像头分辨率（当前 640x480） |
 | 人脸检测失败 | 调整光线，正对摄像头，避免逆光 |
+| 摄像头初始化失败，提示找不到文件（路径含 `_internal\mediapipe\...`），但文件实际存在 | 多为权限/安全软件限制，或程序目录拷贝不完整、残留旧版所致。依次尝试：① 右键 exe 选择「以管理员身份运行」；② 将整个 `AttentionTrainingApp` 目录移到其它位置（如 `D:\APP\`），重新完整解压后再运行 |
 
 ### AI 相关
 

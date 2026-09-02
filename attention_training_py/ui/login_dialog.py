@@ -11,7 +11,6 @@ class LoginDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("注意力训练系统 - 登录")
         self.setMinimumSize(400, 350)
-        self.setFixedSize(450, 420)
         self.setModal(True)
 
         self._logged_in = False
@@ -19,6 +18,9 @@ class LoginDialog(QDialog):
 
         self._setup_ui()
         self._apply_style_sheet()
+        # 固定为布局实际所需的高度：避免 Qt 在窗口显示/拖动时于固定尺寸与
+        # 布局最小尺寸之间来回切换，导致窗口忽大忽小、内容被裁剪。
+        self.setFixedSize(450, max(420, self.layout().minimumSize().height()))
 
     def is_logged_in(self) -> bool:
         return self._logged_in

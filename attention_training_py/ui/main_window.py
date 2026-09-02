@@ -1,5 +1,6 @@
 # ui/main_window.py - 完整修改版
 
+import threading
 import traceback
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QKeyEvent, QPainter
@@ -58,12 +59,34 @@ class MainWindow(QMainWindow):
             wallpaper_manager.wallpaper_changed.connect(self._apply_wallpaper)
             wallpaper_manager.wallpaper_cleared.connect(self._apply_wallpaper)
 
+            # 后台预热本地 ONNX 分析引擎：提前完成 import 与 session 创建并缓存，
+            # 避免训练结束后的首次本地分析出现冷启动高开销（与 CameraWorker 预热策略一致）。
+            if settings.local_analysis_enabled():
+                self._start_local_analysis_warmup()
+
             print("MainWindow initialized successfully")
 
         except Exception as e:
             print(f"MainWindow initialization error: {e}")
             traceback.print_exc()
             raise
+
+    def _start_local_analysis_warmup(self):
+        """后台线程预热 LocalAnalysisEngine，不阻塞界面启动。"""
+        try:
+            def _warmup():
+                try:
+                    from ai.local_analysis import LocalAnalysisEngine
+                    LocalAnalysisEngine.instance().warmup()
+                except Exception as exc:
+                    print(f"LocalAnalysisEngine warmup error: {exc}")
+
+            thread = threading.Thread(
+                target=_warmup, name="local-analysis-warmup", daemon=True
+            )
+            thread.start()
+        except Exception as exc:
+            print(f"Start local analysis warmup error: {exc}")
 
     def keyPressEvent(self, event: QKeyEvent):
         try:

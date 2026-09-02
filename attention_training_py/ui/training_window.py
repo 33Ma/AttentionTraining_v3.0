@@ -2,13 +2,16 @@
 import traceback
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QDateTime, QMutex, QMutexLocker, QMetaObject
 from PySide6.QtGui import QPainter, QKeyEvent, QCloseEvent, QPixmap
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QMessageBox, QDialog, QTextEdit
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QMessageBox, QDialog, QTextEdit, QProgressBar
 
 from core.settings import GlobalSettings, TrainingRecord
 from core.user_session import UserSession
+from core.user_manager import UserManager, UserRole
 from core.achievement_manager import AchievementManager
 from core.sound_manager import SoundManager
 from ai.ai_analysis_manager import AIAnalysisManager
+from ai.composite_scoring import composite_details, score_band_label
+from ui.ai_coach_dialog import AICoachDialog
 from camera.camera_worker import CameraWorker
 from games.spot_difference_game import SpotDifferenceGame
 from games.tracking_game import TrackingGame
@@ -35,6 +38,7 @@ class TrainingWindow(QWidget):
         self._attention_sample_count = 0
         self._total_game_score = 0
         self._max_consecutive_hits = 0
+        self._camera_face_seen = False
 
         # 注视数据
         self._gaze_scores = []
@@ -53,7 +57,10 @@ class TrainingWindow(QWidget):
         # AI 相关
         self._ai_request_id = 0
         self._ai_request_pending = False
+        self._ai_request_is_llm = False
+        self._ai_signals_connected = False
         self._ai_loading_dialog = None
+        self._ai_composite_visible = False
         self._dialog_mutex = QMutex()
         self._finish_mutex = QMutex()
         self._fallback_timer = None
@@ -192,6 +199,8 @@ class TrainingWindow(QWidget):
             # 记录训练用户
             self._training_user_name = UserSession().current_user()
             print(f"Training user: {self._training_user_name}")
+            if not self._training_user_name:
+                print("WARNING: No user logged in, training results will not be saved")
 
             # 锁定训练状态
             UserSession().set_training_active(True)
@@ -509,25 +518,35 @@ class TrainingWindow(QWidget):
 
         self._finish_training()
 
-    def _generate_local_analysis(self, avg_attention: int, total_blinks: int,
-                                  max_consecutive_hits: int, game_score: int,
-                                  game_mode: str, duration_minutes: int,
-                                  avg_gaze_score: int = 0, avg_gaze_distance: float = 0.0) -> str:
-        """生成本地分析报告（本地 ONNX 智能分析；模型不可用时回退规则模板）"""
-        from ai.local_analysis import LocalAnalysisEngine
-        from core.settings import GlobalSettings
-        return LocalAnalysisEngine.instance().analyze_session(
-            avg_attention,
-            total_blinks,
-            max_consecutive_hits,
-            game_score,
-            game_mode,
-            duration_minutes,
-            avg_gaze_score,
-            avg_gaze_distance,
-            use_model=GlobalSettings().local_analysis_enabled(),
+    def _submit_local_analysis(self, avg_attention: int, total_blinks: int,
+                               max_consecutive_hits: int, game_score: int,
+                               game_mode: str, duration_minutes: int,
+                               avg_gaze_score: int = 0, avg_gaze_distance: float = 0.0) -> int:
+        """把本地 ONNX 分析提交到 AIAnalysisManager 后台线程执行，返回 request_id。"""
+        print('[AI] submit LOCAL analysis')
+        settings = GlobalSettings()
+        ai_manager = AIAnalysisManager.instance()
+        self._ai_composite_visible = True
+        self._ai_request_is_llm = False
+        self._disconnect_ai_signals()
+        ai_manager.analysis_ready.connect(self._on_ai_analysis_ready, Qt.UniqueConnection)
+        ai_manager.analysis_error.connect(self._on_ai_analysis_error, Qt.UniqueConnection)
+        self._ai_signals_connected = True
+        return ai_manager.submit_analysis(
+            avg_attention=avg_attention,
+            total_blinks=total_blinks,
+            max_consecutive_hits=max_consecutive_hits,
+            game_score=game_score,
+            game_mode=game_mode,
+            duration_minutes=duration_minutes,
+            api_key="",
+            api_url="",
+            model="",
+            avg_gaze_score=avg_gaze_score,
+            avg_gaze_distance=avg_gaze_distance,
+            difficulty=settings.effective_difficulty_level().value,
+            face_detected=self._camera_face_seen,
         )
-
 
     def _disconnect_all_signals(self):
         """断开所有信号连接"""
@@ -569,19 +588,17 @@ class TrainingWindow(QWidget):
             print(f"Disconnect signals error: {e}")
 
     def _disconnect_ai_signals(self):
-        """断开AI管理器的信号"""
+        """断开AI管理器信号（仅在已连接时断开，避免 PySide6 的 Failed to disconnect 告警）"""
+        if not self._ai_signals_connected:
+            return
         try:
             ai_manager = AIAnalysisManager.instance()
-            try:
-                ai_manager.analysis_ready.disconnect(self._on_ai_analysis_ready)
-            except:
-                pass
-            try:
-                ai_manager.analysis_error.disconnect(self._on_ai_analysis_error)
-            except:
-                pass
+            ai_manager.analysis_ready.disconnect(self._on_ai_analysis_ready)
+            ai_manager.analysis_error.disconnect(self._on_ai_analysis_error)
         except Exception as e:
             print(f"Disconnect AI signals error: {e}")
+        finally:
+            self._ai_signals_connected = False
 
     def _safe_close(self):
         """安全关闭窗口"""
@@ -605,8 +622,13 @@ class TrainingWindow(QWidget):
         """AI 分析完成"""
         if request_id != self._ai_request_id or self._closing or not self._ai_request_pending:
             return
+        print('[AI] ready req=' + str(request_id) + ' cur=' + str(self._ai_request_id) + ' llm=' + str(self._ai_request_is_llm) + ' len=' + str(len(analysis)))
 
         self._ai_request_pending = False
+        if self._fallback_timer:
+            self._fallback_timer.stop()
+            self._fallback_timer.deleteLater()
+            self._fallback_timer = None
 
         locker = QMutexLocker(self._dialog_mutex)
         try:
@@ -616,7 +638,9 @@ class TrainingWindow(QWidget):
         finally:
             locker.unlock()
 
-        QTimer.singleShot(50, lambda: self._show_analysis_dialog(analysis))
+        composite_visible = self._ai_composite_visible
+        self._ai_composite_visible = False
+        QTimer.singleShot(50, lambda: self._show_analysis_dialog(analysis, composite_visible))
 
     def _on_ai_analysis_error(self, request_id: int, error: str):
         """AI 分析错误"""
@@ -624,7 +648,11 @@ class TrainingWindow(QWidget):
             return
 
         self._ai_request_pending = False
-        print(f"AI analysis error: {error}")
+        if self._fallback_timer:
+            self._fallback_timer.stop()
+            self._fallback_timer.deleteLater()
+            self._fallback_timer = None
+        print('[AI] error req=' + str(request_id) + ' cur=' + str(self._ai_request_id) + ' : ' + str(error))
 
         locker = QMutexLocker(self._dialog_mutex)
         try:
@@ -633,6 +661,13 @@ class TrainingWindow(QWidget):
                 self._ai_loading_dialog = None
         finally:
             locker.unlock()
+
+        if self._ai_request_is_llm:
+            QMessageBox.warning(
+                self,
+                "AI分析失败",
+                f"云端AI分析失败：{error}\n已改用本地规则分析。\n请检查API地址、API密钥及网络/代理设置后重试。",
+            )
 
         avg_attention = self._avg_attention_sum // self._attention_sample_count if self._attention_sample_count > 0 else 0
 
@@ -647,7 +682,8 @@ class TrainingWindow(QWidget):
         else:
             self._avg_gaze_distance = 0.0
 
-        local_analysis = self._generate_local_analysis(
+        self._show_ai_loading_dialog()
+        self._ai_request_id = self._submit_local_analysis(
             avg_attention,
             self._total_blinks,
             self._max_consecutive_hits,
@@ -655,12 +691,11 @@ class TrainingWindow(QWidget):
             self._game_mode,
             self._duration_minutes,
             self._avg_gaze_score,
-            self._avg_gaze_distance
+            self._avg_gaze_distance,
         )
+        self._ai_request_pending = True
 
-        QTimer.singleShot(50, lambda: self._show_analysis_dialog(local_analysis))
-
-    def _show_analysis_dialog(self, analysis: str):
+    def _show_analysis_dialog(self, analysis: str, composite_visible: bool = False):
         """显示分析结果对话框"""
         if self._closing or not self.isVisible():
             self._finish_training()
@@ -702,6 +737,58 @@ class TrainingWindow(QWidget):
         text_edit.setReadOnly(True)
         layout.addWidget(text_edit)
 
+        if composite_visible:
+            composite_total, composite_parts = composite_details(
+                avg_attention=self._avg_attention_sum // self._attention_sample_count if self._attention_sample_count > 0 else 0,
+                max_consecutive_hits=self._max_consecutive_hits,
+                game_score=self._total_game_score,
+                game_mode=self._game_mode,
+                difficulty=GlobalSettings().effective_difficulty_level().value,
+                avg_gaze_score=self._avg_gaze_score,
+                face_detected=int(self._camera_face_seen),
+                duration_minutes=self._duration_minutes,
+            )
+            band_color = "#F44336"
+            if composite_total >= 80:
+                band_color = "#4CAF50"
+            elif composite_total >= 65:
+                band_color = "#8BC34A"
+            elif composite_total >= 50:
+                band_color = "#FF9800"
+            elif composite_total >= 35:
+                band_color = "#FF5722"
+
+            composite_card = QWidget(dialog)
+            composite_card.setStyleSheet("background-color: rgba(76, 175, 80, 0.08); border-radius: 10px; padding: 10px;")
+            card_layout = QVBoxLayout(composite_card)
+            card_layout.setSpacing(6)
+
+            score_label = QLabel(f"\U0001f3c6 综合评分\uff1a{composite_total}/100\uff08{score_band_label(composite_total)}\uff09", composite_card)
+            score_label.setAlignment(Qt.AlignCenter)
+            score_label.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {band_color}; background: transparent;")
+            card_layout.addWidget(score_label)
+
+            progress_bar = QProgressBar(composite_card)
+            progress_bar.setRange(0, 100)
+            progress_bar.setValue(composite_total)
+            progress_bar.setTextVisible(False)
+            progress_bar.setFixedHeight(14)
+            progress_bar.setStyleSheet(
+                "QProgressBar { border: none; background-color: #3a3a3a; border-radius: 7px; }"
+                f"QProgressBar::chunk {{ background-color: {band_color}; border-radius: 7px; }}"
+            )
+            card_layout.addWidget(progress_bar)
+
+            breakdown_text = "  \u00b7  ".join(
+                f"{name} {round(part)}/{int(full)}" for name, part, full in composite_parts
+            )
+            breakdown_label = QLabel(breakdown_text, composite_card)
+            breakdown_label.setAlignment(Qt.AlignCenter)
+            breakdown_label.setStyleSheet(f"font-size: 12px; color: {text_color}; background: transparent;")
+            card_layout.addWidget(breakdown_label)
+
+            layout.insertWidget(1, composite_card)
+
         avg_attention = self._avg_attention_sum // self._attention_sample_count if self._attention_sample_count > 0 else 0
         gaze_info = f"  |  注视专注度: {self._avg_gaze_score}" if self._gaze_scores else ""
         summary_label = QLabel(
@@ -715,6 +802,10 @@ class TrainingWindow(QWidget):
         btn_layout = QHBoxLayout()
         close_btn = QPushButton("完成训练", dialog)
         copy_btn = QPushButton("📋 复制报告", dialog)
+        coach_btn = None
+        if UserManager().current_user_role() == UserRole.STUDENT:
+            coach_btn = QPushButton("🤖 继续咨询教练", dialog)
+            coach_btn.clicked.connect(self._on_continue_with_coach)
 
         self._analysis_dialog = dialog
 
@@ -727,11 +818,35 @@ class TrainingWindow(QWidget):
         dialog.finished.connect(self._on_analysis_dialog_finished)
 
         btn_layout.addWidget(copy_btn)
+        if coach_btn:
+            btn_layout.addWidget(coach_btn)
         btn_layout.addStretch()
         btn_layout.addWidget(close_btn)
         layout.addLayout(btn_layout)
 
         dialog.show()
+
+    def _on_continue_with_coach(self):
+        """打开 AI 教练对话框并携带本次训练数据"""
+        try:
+            avg_attention = self._avg_attention_sum // self._attention_sample_count if self._attention_sample_count > 0 else 0
+            context = {
+                "avg_attention": avg_attention,
+                "total_blinks": self._total_blinks,
+                "max_consecutive_hits": self._max_consecutive_hits,
+                "game_score": self._total_game_score,
+                "game_mode": self._game_mode,
+                "duration_minutes": self._duration_minutes,
+                "avg_gaze_score": self._avg_gaze_score,
+                "avg_gaze_distance": self._avg_gaze_distance,
+            }
+            dlg = AICoachDialog(self, session_context=context)
+            dlg.setAttribute(Qt.WA_DeleteOnClose)
+            dlg.show()
+        except Exception as e:
+            print(f"Open coach dialog error: {e}")
+            traceback.print_exc()
+            QMessageBox.critical(self, "错误", f"无法打开AI教练:\n{str(e)}")
 
     def _on_analysis_dialog_finished(self, result: int):
         """分析对话框结束"""
@@ -799,8 +914,6 @@ class TrainingWindow(QWidget):
                 print(f"Successfully switched back to original user: {self._training_user_name}")
 
         settings = GlobalSettings()
-        if settings.current_user() != self._training_user_name:
-            settings.set_current_user(self._training_user_name)
 
         try:
             record = TrainingRecord()
@@ -813,26 +926,62 @@ class TrainingWindow(QWidget):
             record.game_score = self._total_game_score
             record.avg_gaze_score = self._avg_gaze_score
             record.avg_gaze_distance = self._avg_gaze_distance
-            settings.add_training_record(record)
+            self._camera_face_seen = bool(getattr(self._camera_worker, "face_seen", False))
+            record.max_consecutive_hits = self._max_consecutive_hits
+            record.face_detected = int(self._camera_face_seen)
+            if self._game_mode == "dynamic_tracking" and self._game_widget is not None:
+                record.hit_rate = float(getattr(self._game_widget, "hit_rate", lambda: 0.0)())
+                record.avg_response_time = float(
+                    getattr(self._game_widget, "avg_response_time", lambda: 0.0)()
+                )
+                record.path_efficiency = float(
+                    getattr(self._game_widget, "path_efficiency", lambda: 0.0)()
+                )
+            composite_total, _ = composite_details(
+                avg_attention=avg_attention,
+                max_consecutive_hits=self._max_consecutive_hits,
+                game_score=self._total_game_score,
+                game_mode=self._game_mode,
+                difficulty=record.difficulty.value,
+                avg_gaze_score=self._avg_gaze_score,
+                face_detected=int(self._camera_face_seen),
+                duration_minutes=self._duration_minutes,
+            )
+            record.composite_score = composite_total
+            settings.add_training_record_for_user(self._training_user_name, record)
             print("Training record saved")
         except Exception as e:
             print(f"Save record error: {e}")
             traceback.print_exc()
 
-        # ??????????????????????????
+        # 按游戏模式更新成就（找茬/动态追踪两大板块，各 10 个）
         try:
             am = AchievementManager()
             if am._current_user != self._training_user_name:
                 am.switch_user(self._training_user_name)
 
-            am.check_attention_achievement(avg_attention)
-            am.check_blink_achievement(self._total_blinks)
-            am.check_game_score_achievement(self._total_game_score, self._game_mode)
-            am.check_consecutive_hit_achievement(self._max_consecutive_hits)
-            am.check_perfect_game_achievement(avg_attention, self._total_game_score, self._max_consecutive_hits)
-            am.check_steady_focus_achievement(avg_attention, self._duration_minutes * 60)
-            if hasattr(am, 'add_training_minutes'):
-                am.add_training_minutes(self._duration_minutes)
+            hit_rate = 0.0
+            avg_response_time = 0.0
+            path_efficiency = 0.0
+            if self._game_mode == "dynamic_tracking" and self._game_widget is not None:
+                hit_rate = float(getattr(self._game_widget, "hit_rate", lambda: 0.0)())
+                avg_response_time = float(
+                    getattr(self._game_widget, "avg_response_time", lambda: 0.0)()
+                )
+                path_efficiency = float(
+                    getattr(self._game_widget, "path_efficiency", lambda: 0.0)()
+                )
+
+            am.check_training_achievements(
+                game_mode=self._game_mode,
+                avg_attention=avg_attention,
+                game_score=self._total_game_score,
+                max_consecutive_hits=self._max_consecutive_hits,
+                hit_rate=hit_rate,
+                avg_response_time=avg_response_time,
+                path_efficiency=path_efficiency,
+                duration_minutes=self._duration_minutes,
+            )
             am.save_to_file()
             print("Achievements updated")
         except Exception as e:
@@ -853,6 +1002,7 @@ class TrainingWindow(QWidget):
 
             ai_manager.analysis_ready.connect(self._on_ai_analysis_ready, Qt.UniqueConnection)
             ai_manager.analysis_error.connect(self._on_ai_analysis_error, Qt.UniqueConnection)
+            self._ai_signals_connected = True
 
             self._ai_request_id = ai_manager.submit_analysis(
                 avg_attention=avg_attention,
@@ -864,10 +1014,13 @@ class TrainingWindow(QWidget):
                 api_key=settings.api_key(),
                 api_url=settings.api_url(),
                 model=settings.ai_model(),
+                difficulty=settings.effective_difficulty_level().value,
+                face_detected=self._camera_face_seen,
                 avg_gaze_score=self._avg_gaze_score,
                 avg_gaze_distance=self._avg_gaze_distance
             )
             self._ai_request_pending = True
+            self._ai_request_is_llm = True
             print(f"AI request submitted: {self._ai_request_id}")
 
             self._fallback_timer = QTimer(self)
@@ -888,7 +1041,14 @@ class TrainingWindow(QWidget):
                     finally:
                         locker2.unlock()
 
-                    local_analysis = self._generate_local_analysis(
+                    QMessageBox.warning(
+                        self,
+                        "AI分析超时",
+                        "云端AI分析超过30秒未响应，已改用本地规则分析。\n请检查API地址、API密钥以及网络/代理设置后重试。",
+                    )
+
+                    self._show_ai_loading_dialog()
+                    self._ai_request_id = self._submit_local_analysis(
                         avg_attention,
                         self._total_blinks,
                         self._max_consecutive_hits,
@@ -896,25 +1056,17 @@ class TrainingWindow(QWidget):
                         self._game_mode,
                         self._duration_minutes,
                         self._avg_gaze_score,
-                        self._avg_gaze_distance
+                        self._avg_gaze_distance,
                     )
-                    QTimer.singleShot(50, lambda: self._show_analysis_dialog(local_analysis))
+                    self._ai_request_pending = True
 
             self._fallback_timer.timeout.connect(on_fallback_timeout)
-            self._fallback_timer.start(10000)
-
-            def on_ai_success(request_id: int, analysis: str):
-                if request_id == self._ai_request_id:
-                    if self._fallback_timer:
-                        self._fallback_timer.stop()
-                        self._fallback_timer.deleteLater()
-                        self._fallback_timer = None
-
-            ai_manager.analysis_ready.connect(on_ai_success, Qt.UniqueConnection)
+            self._fallback_timer.start(30000)
 
         else:
-            print("AI analysis disabled or no API key, using local analysis")
-            local_analysis = self._generate_local_analysis(
+            print('[AI] cloud skipped -> local analysis: ai_enabled=' + str(settings.ai_enabled()) + ' has_key=' + str(bool(settings.api_key())) + ' local_enabled=' + str(settings.local_analysis_enabled()) + ' user=' + str(self._training_user_name))
+            self._show_ai_loading_dialog()
+            self._ai_request_id = self._submit_local_analysis(
                 avg_attention,
                 self._total_blinks,
                 self._max_consecutive_hits,
@@ -922,9 +1074,9 @@ class TrainingWindow(QWidget):
                 self._game_mode,
                 self._duration_minutes,
                 self._avg_gaze_score,
-                self._avg_gaze_distance
+                self._avg_gaze_distance,
             )
-            QTimer.singleShot(50, lambda: self._show_analysis_dialog(local_analysis))
+            self._ai_request_pending = True
 
     def _finish_training(self):
         """完成训练（发送信号，清理资源）"""

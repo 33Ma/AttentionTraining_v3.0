@@ -1,33 +1,100 @@
 # core/achievement_manager.py
+"""成就管理器：成就按游戏模式分为“找茬模式”与“动态追踪模式”两大专有板块，
+每板块 10 个成就；动态追踪板块不设连击相关成就。
+
+成就数据保存在 users/<用户名>/achievements.json（含各板块累计统计）。
+旧版成就文件（13 个全局成就）加载时自动跳过已移除的成就类型，
+仍在列表中的成就（火眼金睛/完美连击/找茬新手/追踪专家/完美游戏）保留进度。
+"""
+
 import os
 import json
-from enum import Enum, auto
-from datetime import datetime
-from typing import List, Dict, Optional
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
+
 from PySide6.QtCore import QObject, Signal, QDateTime, QMutex, QMutexLocker
-from .settings import GlobalSettings
+
 from .paths import app_data_dir
 
 
 class AchievementType(Enum):
-    ATTENTION_MASTER = auto()
-    EAGLE_EYE = auto()
-    STEADY_FOCUS = auto()
-    BLINK_CONTROLLER = auto()
-    PERFECT_STREAK = auto()
-    MARATHONER = auto()
-    FINDER_NEWBIE = auto()
-    TRACKER_PRO = auto()
-    PERFECT_GAME = auto()
-    ALL_ROUNDER = auto()
-    GAZE_MASTER = auto()
-    STEADY_GAZE = auto()
-    FOCUS_CHAMPION = auto()
+    # ---- 找茬模式（10 个）----
+    FINDER_NEWBIE = 7        # 完成第一次找茬训练
+    EAGLE_EYE = 2            # 找茬累计找到 100 个差异点
+    FINDER_COMBO_10 = 14     # 找茬单次 10 连击
+    PERFECT_STREAK = 5       # 找茬单次 20 连击
+    FINDER_SCORE_300 = 15    # 找茬单次游戏得分 300
+    FINDER_SCORE_500 = 16    # 找茬单次游戏得分 500
+    PERFECT_GAME = 9         # 找茬单次：注意力80+、得分500+、连击10+
+    FINDER_ATTENTION = 17    # 找茬单次平均注意力 80+
+    FINDER_MINUTES = 18      # 找茬累计训练 60 分钟
+    FINDER_SESSIONS = 19     # 找茬累计训练 20 次
+
+    # ---- 动态追踪模式（10 个，无连击）----
+    TRACKER_NEWBIE = 8       # 完成第一次动态追踪训练
+    TRACKER_HIT_RATE = 20    # 动态追踪单次命中率 90%
+    TRACKER_RESPONSE = 21    # 动态追踪单次平均响应 <= 0.5 秒
+    TRACKER_PATH = 22        # 动态追踪单次路径效率 80%
+    TRACKER_SCORE_80 = 23    # 动态追踪单次游戏得分 80
+    TRACKER_SCORE_90 = 24    # 动态追踪单次游戏得分 90
+    TRACKER_PERFECT = 25     # 动态追踪单次：注意力80+、得分90+
+    TRACKER_ATTENTION = 26   # 动态追踪单次平均注意力 80+
+    TRACKER_MINUTES = 27     # 动态追踪累计训练 60 分钟
+    TRACKER_SESSIONS = 28    # 动态追踪累计训练 20 次
+
+
+# (类型, 名称, 描述, 目标值)
+FIND_ACHIEVEMENTS = [
+    (AchievementType.FINDER_NEWBIE, "🔍 找茬新手", "完成第一次找茬模式训练", 1),
+    (AchievementType.EAGLE_EYE, "👁️ 火眼金睛", "找茬模式累计找到100个差异点", 100),
+    (AchievementType.FINDER_COMBO_10, "⚡ 连击新星", "找茬模式单次达成10连击", 10),
+    (AchievementType.PERFECT_STREAK, "⚡ 完美连击", "找茬模式单次达成20连击", 20),
+    (AchievementType.FINDER_SCORE_300, "🏆 高分突破", "找茬模式单次游戏得分达到300", 300),
+    (AchievementType.FINDER_SCORE_500, "👑 找茬大师", "找茬模式单次游戏得分达到500", 500),
+    (AchievementType.PERFECT_GAME, "💎 完美游戏", "找茬模式单次训练：注意力80+、得分500+、连击10+", 100),
+    (AchievementType.FINDER_ATTENTION, "🧠 专注达人", "找茬模式单次平均注意力达到80分", 80),
+    (AchievementType.FINDER_MINUTES, "🕒 坚持之星", "找茬模式累计训练60分钟", 60),
+    (AchievementType.FINDER_SESSIONS, "🔥 高频训练", "找茬模式累计训练20次", 20),
+]
+
+TRACKING_ACHIEVEMENTS = [
+    (AchievementType.TRACKER_NEWBIE, "🎯 追踪新手", "完成第一次动态追踪模式训练", 1),
+    (AchievementType.TRACKER_HIT_RATE, "🎯 弹无虚发", "动态追踪单次命中率达到90%", 90),
+    (AchievementType.TRACKER_RESPONSE, "⚡ 反应神速", "动态追踪单次平均响应不超过0.5秒", 500),
+    (AchievementType.TRACKER_PATH, "🧭 精准路径", "动态追踪单次路径效率达到80%", 80),
+    (AchievementType.TRACKER_SCORE_80, "🏆 追踪突破", "动态追踪单次游戏得分达到80", 80),
+    (AchievementType.TRACKER_SCORE_90, "👑 追踪大师", "动态追踪单次游戏得分达到90", 90),
+    (AchievementType.TRACKER_PERFECT, "💎 完美追踪", "动态追踪单次训练：注意力80+、得分90+", 100),
+    (AchievementType.TRACKER_ATTENTION, "🧠 专注达人", "动态追踪单次平均注意力达到80分", 80),
+    (AchievementType.TRACKER_MINUTES, "🕒 坚持之星", "动态追踪模式累计训练60分钟", 60),
+    (AchievementType.TRACKER_SESSIONS, "🔥 高频训练", "动态追踪模式累计训练20次", 20),
+]
+
+FIND_TYPES = tuple(t for t, _, _, _ in FIND_ACHIEVEMENTS)
+TRACKING_TYPES = tuple(t for t, _, _, _ in TRACKING_ACHIEVEMENTS)
+
+_PROGRESS_UNITS = {
+    AchievementType.EAGLE_EYE: "个差异点",
+    AchievementType.FINDER_COMBO_10: "连击",
+    AchievementType.PERFECT_STREAK: "连击",
+    AchievementType.FINDER_SCORE_300: "分",
+    AchievementType.FINDER_SCORE_500: "分",
+    AchievementType.FINDER_ATTENTION: "分",
+    AchievementType.TRACKER_ATTENTION: "分",
+    AchievementType.TRACKER_SCORE_80: "分",
+    AchievementType.TRACKER_SCORE_90: "分",
+    AchievementType.FINDER_MINUTES: "分钟",
+    AchievementType.TRACKER_MINUTES: "分钟",
+    AchievementType.FINDER_SESSIONS: "次",
+    AchievementType.TRACKER_SESSIONS: "次",
+    AchievementType.TRACKER_HIT_RATE: "%",
+    AchievementType.TRACKER_PATH: "%",
+}
 
 
 class Achievement:
     def __init__(self):
-        self.type: AchievementType = AchievementType.ATTENTION_MASTER
+        self.type: AchievementType = AchievementType.FINDER_NEWBIE
         self.name: str = ""
         self.description: str = ""
         self.unlocked: bool = False
@@ -84,42 +151,23 @@ class AchievementManager(QObject):
 
         self.app_dir = app_data_dir()
         self._achievements: Dict[AchievementType, Achievement] = {}
-        self._total_training_minutes = 0
         self._current_user = ""
         self.MAX_PROGRESS = 100
 
         self._mutex = QMutex()
         self._is_loading = False  # 防止重入
 
-        self._total_focused_time = 0
-        self._best_gaze_score = 0
-        self._consecutive_focused_frames = 0
-        self._max_consecutive_focused_frames = 0
+        # 各板块累计统计
+        self._total_minutes_find = 0
+        self._total_minutes_tracking = 0
+        self._total_sessions_find = 0
+        self._total_sessions_tracking = 0
+        self._total_find_points = 0  # 找茬累计游戏得分（火眼金睛按得分/10 近似差异点）
 
         self._init_achievements()
-        print("AchievementManager initialized (waiting for user load)")
-
-    def _get_other_achievements_count(self) -> int:
-        return sum(1 for ach_type in self._achievements.keys()
-                   if ach_type != AchievementType.ALL_ROUNDER)
 
     def _init_achievements(self):
-        achievements_data = [
-            (AchievementType.ATTENTION_MASTER, "🧠 注意力大师", "单次训练平均注意力分数达到80分以上", 80),
-            (AchievementType.EAGLE_EYE, "👁️ 火眼金睛", "在找茬模式中发现100个差异点", 100),
-            (AchievementType.STEADY_FOCUS, "🎯 稳如泰山", "连续30秒保持注意力分数70分以上", 30),
-            (AchievementType.BLINK_CONTROLLER, "😎 眨眼控制师", "单次训练眨眼次数少于10次", 10),
-            (AchievementType.PERFECT_STREAK, "⚡ 完美连击", "达成20连击", 20),
-            (AchievementType.MARATHONER, "🏃 马拉松选手", "累计训练时长达到60分钟", 60),
-            (AchievementType.FINDER_NEWBIE, "🔍 找茬新手", "完成第一次找茬模式训练", 1),
-            (AchievementType.TRACKER_PRO, "🎯 追踪专家", "完成第一次动态追踪模式训练", 1),
-            (AchievementType.PERFECT_GAME, "💎 完美游戏", "单次训练中同时达成：注意力80+、游戏得分500+、连击10+", 100),
-            (AchievementType.ALL_ROUNDER, "👑 全能选手", "解锁所有其他成就", 0),
-            (AchievementType.GAZE_MASTER, "👀 注视大师", "单次训练中注视专注度达到90分以上", 90),
-            (AchievementType.STEADY_GAZE, "🎯 稳定注视", "单次训练中连续60秒注视偏离距离小于0.15", 60),
-            (AchievementType.FOCUS_CHAMPION, "⭐ 专注冠军", "累计专注时间达到30分钟（注视距离<0.2）", 1800),
-        ]
-
+        achievements_data = FIND_ACHIEVEMENTS + TRACKING_ACHIEVEMENTS
         self._achievements.clear()
         for ach_type, name, desc, target in achievements_data:
             ach = Achievement()
@@ -127,11 +175,8 @@ class AchievementManager(QObject):
             ach.name = name
             ach.description = desc
             ach.target = target
-            if ach_type == AchievementType.ALL_ROUNDER:
-                other_count = self._get_other_achievements_count()
-                ach.progress_text = f"0/{other_count}"
-            else:
-                ach.progress_text = f"0/{target}" if target > 0 else "0/0"
+            unit = _PROGRESS_UNITS.get(ach_type, "")
+            ach.progress_text = f"0/{target}{unit}" if target > 0 else "0/0"
             self._achievements[ach_type] = ach
 
     def _get_user_achievement_path(self, username: str = None) -> str:
@@ -139,11 +184,11 @@ class AchievementManager(QObject):
             if self._current_user:
                 username = self._current_user
             else:
-                settings = GlobalSettings()
-                username = settings.current_user()
+                from .settings import GlobalSettings
+                username = GlobalSettings().current_user()
 
         if not username:
-            username = "默认用户"
+            return ""
 
         user_dir = os.path.join(self.app_dir, "users", username)
         os.makedirs(user_dir, exist_ok=True)
@@ -154,50 +199,35 @@ class AchievementManager(QObject):
         self._load_current_user_data()
 
     def _load_current_user_data(self):
-        """加载当前用户数据 - 修复死锁版本"""
-        # 防止重入
+        """加载当前用户数据 - 防重入版本"""
         if self._is_loading:
             print("AchievementManager: Already loading, skipping")
             return
 
-        # 使用类级别锁防止并发加载
         if not AchievementManager._loading_lock.tryLock():
             print("AchievementManager: Another load in progress, skipping")
             return
 
         try:
             self._is_loading = True
-            print(f"AchievementManager: Loading data for user: {self._current_user}")
-
-            settings = GlobalSettings()
-            user = settings.current_user()
-
-            if self._current_user:
-                user = self._current_user
-
+            user = self._current_user
             if not user:
-                user = "默认用户"
+                from .settings import GlobalSettings
+                user = GlobalSettings().current_user()
+            if not user:
+                self._current_user = ""
+                print("AchievementManager: No user logged in, skipping load")
+                return
 
-            # 重置成就数据
-            for ach in self._achievements.values():
-                ach.unlocked = False
-                ach.progress = 0
-                ach.unlock_time = None
-                if ach.type == AchievementType.ALL_ROUNDER:
-                    other_count = self._get_other_achievements_count()
-                    ach.progress_text = f"0/{other_count}"
-                else:
-                    ach.progress_text = f"0/{ach.target}" if ach.target > 0 else "0/0"
-
-            self._total_training_minutes = 0
-            self._total_focused_time = 0
-            self._best_gaze_score = 0
-            self._consecutive_focused_frames = 0
-            self._max_consecutive_focused_frames = 0
-
+            # 重置成就数据与累计统计
+            self._init_achievements()
+            self._total_minutes_find = 0
+            self._total_minutes_tracking = 0
+            self._total_sessions_find = 0
+            self._total_sessions_tracking = 0
+            self._total_find_points = 0
             self._current_user = user
 
-            # 尝试加载用户数据
             path = self._get_user_achievement_path(user)
             if os.path.exists(path):
                 self._load_from_file_unsafe(path)
@@ -217,28 +247,28 @@ class AchievementManager(QObject):
             AchievementManager._loading_lock.unlock()
 
     def _load_from_file_unsafe(self, path: str):
-        """从文件加载数据（不加锁，内部调用）"""
+        """从文件加载数据（不加锁，内部调用）。旧文件里已移除的成就类型自动跳过。"""
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
             achievements_data = data.get('achievements', [])
-            self._total_training_minutes = data.get('total_training_minutes', 0)
-            self._total_focused_time = data.get('total_focused_time', 0)
-            self._best_gaze_score = data.get('best_gaze_score', 0)
-            self._consecutive_focused_frames = data.get('consecutive_focused_frames', 0)
-            self._max_consecutive_focused_frames = data.get('max_consecutive_focused_frames', 0)
+            # 旧版全局训练时长作为两种模式累计时长的兜底
+            legacy_minutes = data.get('total_training_minutes', 0)
+            self._total_minutes_find = data.get('total_minutes_find', legacy_minutes)
+            self._total_minutes_tracking = data.get('total_minutes_tracking', legacy_minutes)
+            self._total_sessions_find = data.get('total_sessions_find', 0)
+            self._total_sessions_tracking = data.get('total_sessions_tracking', 0)
+            self._total_find_points = data.get('total_find_points', 0)
 
             for ach_data in achievements_data:
-                ach_type = AchievementType(ach_data.get('type', 1))
+                try:
+                    ach_type = AchievementType(ach_data.get('type', -1))
+                except ValueError:
+                    continue
                 if ach_type in self._achievements:
                     saved_ach = Achievement.from_dict(ach_data)
                     self._achievements[ach_type] = saved_ach
-
-            allrounder = self._achievements.get(AchievementType.ALL_ROUNDER)
-            if allrounder and allrounder.unlocked:
-                other_count = self._get_other_achievements_count()
-                allrounder.progress_text = f"{other_count}/{other_count}"
 
         except Exception as e:
             print(f"AchievementManager: Error loading from file {path}: {e}")
@@ -254,11 +284,11 @@ class AchievementManager(QObject):
 
             data = {
                 'achievements': [ach.to_dict() for ach in self._achievements.values()],
-                'total_training_minutes': self._total_training_minutes,
-                'total_focused_time': self._total_focused_time,
-                'best_gaze_score': self._best_gaze_score,
-                'consecutive_focused_frames': self._consecutive_focused_frames,
-                'max_consecutive_focused_frames': self._max_consecutive_focused_frames
+                'total_minutes_find': self._total_minutes_find,
+                'total_minutes_tracking': self._total_minutes_tracking,
+                'total_sessions_find': self._total_sessions_find,
+                'total_sessions_tracking': self._total_sessions_tracking,
+                'total_find_points': self._total_find_points,
             }
 
             with open(path, 'w', encoding='utf-8') as f:
@@ -270,9 +300,10 @@ class AchievementManager(QObject):
             print(f"AchievementManager: Error saving achievements: {e}")
 
     def switch_user(self, username: str):
-        """切换用户 - 修复防重入版本"""
+        """切换用户 - 防重入版本"""
         if not username:
-            username = "默认用户"
+            self._current_user = ""
+            return
 
         if self._current_user == username:
             print(f"AchievementManager.switch_user: Already on {username}, skipping")
@@ -280,7 +311,6 @@ class AchievementManager(QObject):
 
         print(f"AchievementManager.switch_user: Switching to {username}")
 
-        # 使用锁保护整个切换过程
         locker = QMutexLocker(self._mutex)
         try:
             self._current_user = username
@@ -297,6 +327,13 @@ class AchievementManager(QObject):
     def get_all_achievements(self) -> List[Achievement]:
         return list(self._achievements.values())
 
+    def achievement_groups(self) -> List[Tuple[str, List[Achievement]]]:
+        """返回两大板块及其成就，供成就对话框分组展示。"""
+        return [
+            ("🔍 找茬模式", [self._achievements[t] for t in FIND_TYPES]),
+            ("🎯 动态追踪模式", [self._achievements[t] for t in TRACKING_TYPES]),
+        ]
+
     def get_unlocked_count(self) -> int:
         return sum(1 for ach in self._achievements.values() if ach.unlocked)
 
@@ -306,127 +343,137 @@ class AchievementManager(QObject):
     def get_achievement(self, ach_type: AchievementType) -> Optional[Achievement]:
         return self._achievements.get(ach_type)
 
-    def add_training_minutes(self, minutes: int):
-        if minutes <= 0:
+    # ------------------------------------------------------------------
+    # 训练成就检查（按模式）
+    # ------------------------------------------------------------------
+    def check_training_achievements(
+        self,
+        *,
+        game_mode: str,
+        avg_attention: int,
+        game_score: int,
+        max_consecutive_hits: int = 0,
+        hit_rate: float = 0.0,
+        avg_response_time: float = 0.0,
+        path_efficiency: float = 0.0,
+        duration_minutes: int = 0,
+    ):
+        """训练结束后按游戏模式更新成就；动态追踪不检查任何连击成就。"""
+        if game_mode == "find_difference":
+            self._total_minutes_find += max(0, duration_minutes)
+            self._total_sessions_find += 1
+            self._total_find_points += max(0, game_score)
+            self._check_find_achievements(
+                avg_attention=avg_attention,
+                game_score=game_score,
+                max_consecutive_hits=max_consecutive_hits,
+            )
+        elif game_mode == "dynamic_tracking":
+            self._total_minutes_tracking += max(0, duration_minutes)
+            self._total_sessions_tracking += 1
+            self._check_tracking_achievements(
+                avg_attention=avg_attention,
+                game_score=game_score,
+                hit_rate=hit_rate,
+                avg_response_time=avg_response_time,
+                path_efficiency=path_efficiency,
+            )
+        else:
             return
-        self._total_training_minutes += minutes
-        self.check_training_duration_achievement(self._total_training_minutes)
         self._save_to_file_unsafe()
 
-    def check_attention_achievement(self, attention_score: int):
-        ach = self._achievements[AchievementType.ATTENTION_MASTER]
-        if not ach.unlocked and attention_score >= ach.target:
-            self._unlock_achievement(AchievementType.ATTENTION_MASTER)
-        elif not ach.unlocked:
-            progress = min(self.MAX_PROGRESS, (attention_score * self.MAX_PROGRESS) // ach.target)
-            self._update_progress(AchievementType.ATTENTION_MASTER, progress)
+    def _check_find_achievements(self, *, avg_attention: int, game_score: int,
+                                 max_consecutive_hits: int):
+        self._check_cumulative(AchievementType.FINDER_NEWBIE,
+                               1 if game_score > 0 else 0)
+        # 火眼金睛：每个差异点基础 10 分，累计得分/10 近似累计差异点
+        self._check_cumulative(AchievementType.EAGLE_EYE,
+                               self._total_find_points // 10)
+        self._check_cumulative(AchievementType.FINDER_COMBO_10,
+                               max_consecutive_hits)
+        self._check_cumulative(AchievementType.PERFECT_STREAK,
+                               max_consecutive_hits)
+        self._check_cumulative(AchievementType.FINDER_SCORE_300, game_score)
+        self._check_cumulative(AchievementType.FINDER_SCORE_500, game_score)
+        self._check_cumulative(AchievementType.FINDER_ATTENTION, avg_attention)
+        self._check_cumulative(AchievementType.FINDER_MINUTES,
+                               self._total_minutes_find)
+        self._check_cumulative(AchievementType.FINDER_SESSIONS,
+                               self._total_sessions_find)
 
-    def check_blink_achievement(self, blink_count: int):
-        ach = self._achievements[AchievementType.BLINK_CONTROLLER]
-        if not ach.unlocked and blink_count <= ach.target and blink_count > 0:
-            self._unlock_achievement(AchievementType.BLINK_CONTROLLER)
-        elif not ach.unlocked and blink_count > 0:
-            progress = min(self.MAX_PROGRESS,
-                          max(0, int((1.0 - (blink_count - ach.target) / 50.0) * self.MAX_PROGRESS)))
-            self._update_progress(AchievementType.BLINK_CONTROLLER, progress)
-
-    def check_game_score_achievement(self, game_score: int, game_mode: str):
-        if game_mode == "find_difference":
-            ach = self._achievements[AchievementType.EAGLE_EYE]
-            if not ach.unlocked:
-                progress = min(self.MAX_PROGRESS, (game_score // 10 * self.MAX_PROGRESS) // ach.target)
-                self._update_progress(AchievementType.EAGLE_EYE, progress)
-                if game_score // 10 >= ach.target:
-                    self._unlock_achievement(AchievementType.EAGLE_EYE)
-
-            finder_ach = self._achievements[AchievementType.FINDER_NEWBIE]
-            if not finder_ach.unlocked and game_score > 0:
-                self._unlock_achievement(AchievementType.FINDER_NEWBIE)
-        elif game_mode == "dynamic_tracking":
-            tracker_ach = self._achievements[AchievementType.TRACKER_PRO]
-            if not tracker_ach.unlocked and game_score > 0:
-                self._unlock_achievement(AchievementType.TRACKER_PRO)
-
-    def check_consecutive_hit_achievement(self, consecutive_hits: int):
-        ach = self._achievements[AchievementType.PERFECT_STREAK]
-        if not ach.unlocked:
-            progress = min(self.MAX_PROGRESS, (consecutive_hits * self.MAX_PROGRESS) // ach.target)
-            self._update_progress(AchievementType.PERFECT_STREAK, progress)
-            if consecutive_hits >= ach.target:
-                self._unlock_achievement(AchievementType.PERFECT_STREAK)
-
-    def check_training_duration_achievement(self, total_minutes: int):
-        ach = self._achievements[AchievementType.MARATHONER]
-        if not ach.unlocked:
-            progress = min(self.MAX_PROGRESS, (total_minutes * self.MAX_PROGRESS) // ach.target)
-            self._update_progress(AchievementType.MARATHONER, progress)
-            if total_minutes >= ach.target:
-                self._unlock_achievement(AchievementType.MARATHONER)
-
-    def check_perfect_game_achievement(self, attention_score: int, game_score: int, consecutive_hits: int):
         ach = self._achievements[AchievementType.PERFECT_GAME]
         if not ach.unlocked:
-            perfect = attention_score >= 80 and game_score >= 500 and consecutive_hits >= 10
+            perfect = (
+                avg_attention >= 80
+                and game_score >= 500
+                and max_consecutive_hits >= 10
+            )
             if perfect:
                 self._unlock_achievement(AchievementType.PERFECT_GAME)
             else:
-                ach.progress_text = f"注意{attention_score}/80 得分{game_score}/500 连击{consecutive_hits}/10"
+                ach.progress_text = (
+                    f"注意{avg_attention}/80 得分{game_score}/500 "
+                    f"连击{max_consecutive_hits}/10"
+                )
                 self.achievement_progress_updated.emit(ach.name, -1)
 
-    def check_steady_focus_achievement(self, attention_score: int, duration_seconds: int):
-        ach = self._achievements[AchievementType.STEADY_FOCUS]
-        if not ach.unlocked and attention_score >= 70 and duration_seconds >= ach.target:
-            self._unlock_achievement(AchievementType.STEADY_FOCUS)
-        elif not ach.unlocked and duration_seconds > 0:
-            progress = min(self.MAX_PROGRESS, (duration_seconds * self.MAX_PROGRESS) // ach.target)
-            self._update_progress(AchievementType.STEADY_FOCUS, progress)
+    def _check_tracking_achievements(self, *, avg_attention: int, game_score: int,
+                                     hit_rate: float, avg_response_time: float,
+                                     path_efficiency: float):
+        self._check_cumulative(AchievementType.TRACKER_NEWBIE,
+                               1 if game_score > 0 else 0)
+        self._check_cumulative(AchievementType.TRACKER_HIT_RATE,
+                               int(round(hit_rate * 100.0)))
+        self._check_cumulative(AchievementType.TRACKER_PATH,
+                               int(round(path_efficiency * 100.0)))
+        self._check_cumulative(AchievementType.TRACKER_SCORE_80, game_score)
+        self._check_cumulative(AchievementType.TRACKER_SCORE_90, game_score)
+        self._check_cumulative(AchievementType.TRACKER_ATTENTION, avg_attention)
+        self._check_cumulative(AchievementType.TRACKER_MINUTES,
+                               self._total_minutes_tracking)
+        self._check_cumulative(AchievementType.TRACKER_SESSIONS,
+                               self._total_sessions_tracking)
 
-    def update_gaze_data(self, gaze_score: int, gaze_distance: float, duration_seconds: int = 1):
-        if gaze_score > self._best_gaze_score:
-            self._best_gaze_score = gaze_score
+        # 平均响应时间：<= 0.5 秒解锁（无命中时不检查）
+        rt_ms = avg_response_time * 1000.0
+        if rt_ms > 0:
+            if rt_ms <= 500:
+                self._unlock_achievement(AchievementType.TRACKER_RESPONSE)
+            else:
+                progress = int(
+                    max(0.0, min(1.0, (800.0 - rt_ms) / 300.0)) * self.MAX_PROGRESS
+                )
+                self._update_progress(AchievementType.TRACKER_RESPONSE, progress)
 
-        self._check_gaze_master_achievement(gaze_score)
+        ach = self._achievements[AchievementType.TRACKER_PERFECT]
+        if not ach.unlocked:
+            perfect = avg_attention >= 80 and game_score >= 90
+            if perfect:
+                self._unlock_achievement(AchievementType.TRACKER_PERFECT)
+            else:
+                ach.progress_text = (
+                    f"注意{avg_attention}/80 得分{game_score}/90"
+                )
+                self.achievement_progress_updated.emit(ach.name, -1)
 
-        if gaze_distance < 0.15:
-            self._consecutive_focused_frames += duration_seconds
-            self._max_consecutive_focused_frames = max(
-                self._max_consecutive_focused_frames,
-                self._consecutive_focused_frames
-            )
-            self._check_steady_gaze_achievement(self._consecutive_focused_frames)
+    def _check_cumulative(self, ach_type: AchievementType, value: int):
+        """按目标值推进进度，达到目标即解锁。"""
+        ach = self._achievements[ach_type]
+        if ach.unlocked:
+            return
+        value = max(0, int(value))
+        if value >= ach.target:
+            self._unlock_achievement(ach_type)
         else:
-            self._consecutive_focused_frames = 0
+            progress = min(
+                self.MAX_PROGRESS,
+                (value * self.MAX_PROGRESS) // ach.target if ach.target > 0 else 0,
+            )
+            self._update_progress(ach_type, progress)
 
-        if gaze_distance < 0.2:
-            self._total_focused_time += duration_seconds
-            self._check_focus_champion_achievement(self._total_focused_time)
-
-        self._save_to_file_unsafe()
-
-    def _check_gaze_master_achievement(self, gaze_score: int):
-        ach = self._achievements[AchievementType.GAZE_MASTER]
-        if not ach.unlocked:
-            progress = min(self.MAX_PROGRESS, (gaze_score * self.MAX_PROGRESS) // ach.target)
-            self._update_progress(AchievementType.GAZE_MASTER, progress)
-            if gaze_score >= ach.target:
-                self._unlock_achievement(AchievementType.GAZE_MASTER)
-
-    def _check_steady_gaze_achievement(self, consecutive_seconds: int):
-        ach = self._achievements[AchievementType.STEADY_GAZE]
-        if not ach.unlocked:
-            progress = min(self.MAX_PROGRESS, (consecutive_seconds * self.MAX_PROGRESS) // ach.target)
-            self._update_progress(AchievementType.STEADY_GAZE, progress)
-            if consecutive_seconds >= ach.target:
-                self._unlock_achievement(AchievementType.STEADY_GAZE)
-
-    def _check_focus_champion_achievement(self, total_seconds: int):
-        ach = self._achievements[AchievementType.FOCUS_CHAMPION]
-        if not ach.unlocked:
-            progress = min(self.MAX_PROGRESS, (total_seconds * self.MAX_PROGRESS) // ach.target)
-            self._update_progress(AchievementType.FOCUS_CHAMPION, progress)
-            if total_seconds >= ach.target:
-                self._unlock_achievement(AchievementType.FOCUS_CHAMPION)
-
+    # ------------------------------------------------------------------
+    # 解锁与进度
+    # ------------------------------------------------------------------
     def _unlock_achievement(self, ach_type: AchievementType):
         ach = self._achievements[ach_type]
         if ach.unlocked:
@@ -435,28 +482,11 @@ class AchievementManager(QObject):
         ach.unlocked = True
         ach.unlock_time = QDateTime.currentDateTime()
         ach.progress = self.MAX_PROGRESS
-        if ach_type != AchievementType.ALL_ROUNDER:
-            ach.progress_text = f"{ach.target}/{ach.target}"
-        else:
-            other_count = self._get_other_achievements_count()
-            ach.progress_text = f"{other_count}/{other_count}"
+        unit = _PROGRESS_UNITS.get(ach_type, "")
+        ach.progress_text = f"{ach.target}/{ach.target}{unit}"
 
         self.achievement_unlocked.emit(ach.name)
         self._save_to_file_unsafe()
-
-        other_count = self._get_other_achievements_count()
-        unlocked_others = sum(1 for a in self._achievements.values()
-                              if a.unlocked and a.type != AchievementType.ALL_ROUNDER)
-
-        if unlocked_others >= other_count:
-            allrounder = self._achievements[AchievementType.ALL_ROUNDER]
-            if not allrounder.unlocked:
-                self._unlock_achievement(AchievementType.ALL_ROUNDER)
-        else:
-            allrounder = self._achievements[AchievementType.ALL_ROUNDER]
-            if not allrounder.unlocked:
-                progress = (unlocked_others * self.MAX_PROGRESS) // other_count
-                self._update_progress(AchievementType.ALL_ROUNDER, progress)
 
     def _update_progress(self, ach_type: AchievementType, progress: int):
         ach = self._achievements[ach_type]
@@ -467,46 +497,28 @@ class AchievementManager(QObject):
         if new_progress != ach.progress:
             ach.progress = new_progress
 
-            if ach_type == AchievementType.MARATHONER:
-                current_minutes = (new_progress * ach.target) // self.MAX_PROGRESS
-                ach.progress_text = f"{current_minutes}/{ach.target}分钟"
-            elif ach_type == AchievementType.ALL_ROUNDER:
-                other_count = self._get_other_achievements_count()
-                unlocked_others = (new_progress * other_count) // self.MAX_PROGRESS
-                unlocked_others = min(unlocked_others, other_count)
-                ach.progress_text = f"{unlocked_others}/{other_count}"
-            elif ach_type == AchievementType.GAZE_MASTER:
-                current_score = (new_progress * ach.target) // self.MAX_PROGRESS
-                ach.progress_text = f"{current_score}/{ach.target}分"
-            elif ach_type == AchievementType.STEADY_GAZE:
-                current_seconds = (new_progress * ach.target) // self.MAX_PROGRESS
-                ach.progress_text = f"{current_seconds}/{ach.target}秒"
-            elif ach_type == AchievementType.FOCUS_CHAMPION:
-                current_seconds = (new_progress * ach.target) // self.MAX_PROGRESS
-                minutes = current_seconds // 60
-                target_minutes = ach.target // 60
-                ach.progress_text = f"{minutes}/{target_minutes}分钟"
+            unit = _PROGRESS_UNITS.get(ach_type, "")
+            if ach_type == AchievementType.TRACKER_RESPONSE:
+                # 进度条越满表示响应越接近 500ms 目标
+                ach.progress_text = (
+                    f"{int(round(500 + (1 - new_progress / 100.0) * 300))}ms"
+                )
+            elif unit:
+                current_value = int(round(new_progress * ach.target / self.MAX_PROGRESS))
+                ach.progress_text = f"{current_value}/{ach.target}{unit}"
             else:
-                current_value = (new_progress * ach.target) // self.MAX_PROGRESS
+                current_value = int(round(new_progress * ach.target / self.MAX_PROGRESS))
                 ach.progress_text = f"{current_value}/{ach.target}"
 
             self.achievement_progress_updated.emit(ach.name, new_progress)
 
     def reset_achievements(self):
-        for ach in self._achievements.values():
-            ach.unlocked = False
-            ach.progress = 0
-            ach.unlock_time = None
-            if ach.type != AchievementType.ALL_ROUNDER:
-                ach.progress_text = f"0/{ach.target}"
-            else:
-                other_count = self._get_other_achievements_count()
-                ach.progress_text = f"0/{other_count}"
-        self._total_training_minutes = 0
-        self._total_focused_time = 0
-        self._best_gaze_score = 0
-        self._consecutive_focused_frames = 0
-        self._max_consecutive_focused_frames = 0
+        self._init_achievements()
+        self._total_minutes_find = 0
+        self._total_minutes_tracking = 0
+        self._total_sessions_find = 0
+        self._total_sessions_tracking = 0
+        self._total_find_points = 0
         self._save_to_file_unsafe()
 
     def save_to_file(self):

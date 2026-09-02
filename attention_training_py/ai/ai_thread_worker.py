@@ -1,8 +1,10 @@
 # ai/ai_thread_worker.py
 import json
 import requests
+import threading
 from typing import Optional
-from PySide6.QtCore import QObject, Signal, QMutex, QMutexLocker, QTimer, QThread
+from PySide6.QtCore import QObject, Signal, QMutex, QMutexLocker, QThread, Slot
+from .coach_logic import normalize_chat_completions_url
 
 
 class AIThreadWorker(QObject):
@@ -14,17 +16,34 @@ class AIThreadWorker(QObject):
         super().__init__(parent)
         self._cancelled = False
         self._mutex = QMutex()
-        self._timeout_timer = QTimer()
-        self._timeout_timer.setSingleShot(True)
-        self._timeout_timer.setInterval(10000)
-        self._timeout_timer.timeout.connect(self._on_timeout)
         self._finished = False
+        self._pending = None
+
+    def set_request(self, request: dict):
+        """保存待处理请求参数（线程启动前调用）。"""
+        self._pending = request
+
+    @Slot()
+    def run_current(self):
+        """由线程 started 信号调用，确保在工作线程内执行。"""
+        if self._pending is None:
+            return
+        req, self._pending = self._pending, None
+        self.process_training_analysis(
+            req["avg_attention"], req["total_blinks"],
+            req["max_consecutive_hits"], req["game_score"],
+            req["game_mode"], req["duration_minutes"],
+            req["api_key"], req["api_url"], req["model"],
+            req["avg_gaze_score"], req["avg_gaze_distance"],
+            req.get("difficulty", "normal"), req.get("face_detected"),
+        )
 
     def process_training_analysis(self, avg_attention: int, total_blinks: int,
                                    max_consecutive_hits: int, game_score: int,
                                    game_mode: str, duration_minutes: int,
                                    api_key: str, api_url: str, model: str,
-                                   avg_gaze_score: int = 0, avg_gaze_distance: float = 0.0):
+                                   avg_gaze_score: int = 0, avg_gaze_distance: float = 0.0,
+                                   difficulty: str = "normal", face_detected: Optional[bool] = None):
         """处理训练分析"""
         if self._finished:
             return
@@ -40,6 +59,8 @@ class AIThreadWorker(QObject):
                     avg_attention, total_blinks, max_consecutive_hits,
                     game_score, game_mode, duration_minutes,
                     avg_gaze_score, avg_gaze_distance,
+                    difficulty=difficulty,
+                    face_detected=face_detected,
                     use_model=GlobalSettings().local_analysis_enabled(),
                 )
                 self.analysis_ready.emit(local_analysis)
@@ -71,11 +92,33 @@ class AIThreadWorker(QObject):
                 'max_tokens': 400
             }
 
-            self._timeout_timer.start()
+            api_url = normalize_chat_completions_url(api_url)
 
-            response = requests.post(api_url, headers=headers, json=data, timeout=10)
+            # 请求放到守护线程执行，工作线程轮询取消标记，保证取消能立即返回
+            result_box = {}
 
-            self._timeout_timer.stop()
+            def _post():
+                try:
+                    result_box["response"] = requests.post(
+                        api_url, headers=headers, json=data, timeout=30,
+                    )
+                except Exception as exc:
+                    result_box["exception"] = exc
+
+            post_thread = threading.Thread(target=_post, daemon=True)
+            post_thread.start()
+            print('[AI] worker posting url=' + str(api_url))
+            while post_thread.is_alive():
+                if self._cancelled or self._finished:
+                    self.finished.emit()
+                    self._finished = True
+                    return
+                post_thread.join(0.2)
+
+            if "exception" in result_box:
+                raise result_box["exception"]
+            response = result_box["response"]
+            print('[AI] worker http status=' + str(response.status_code))
 
             locker = QMutexLocker(self._mutex)
             try:
@@ -89,6 +132,7 @@ class AIThreadWorker(QObject):
             if response.status_code == 200:
                 result = response.json()
                 content = result['choices'][0]['message']['content']
+                print('[AI] worker content len=' + str(len(content)))
                 self.analysis_ready.emit(content)
             else:
                 error_msg = f"API错误: {response.status_code}"
@@ -115,18 +159,6 @@ class AIThreadWorker(QObject):
         locker = QMutexLocker(self._mutex)
         self._cancelled = True
         locker.unlock()
-
-    def _on_timeout(self):
-        """超时处理"""
-        locker = QMutexLocker(self._mutex)
-        try:
-            if not self._cancelled and not self._finished:
-                self._cancelled = True
-                self.analysis_error.emit("AI分析超时，请检查网络连接后重试")
-                self.finished.emit()
-                self._finished = True
-        finally:
-            locker.unlock()
 
     def _build_prompt(self, avg_attention: int, total_blinks: int,
                               max_consecutive_hits: int, game_score: int,
@@ -170,8 +202,9 @@ class AIThreadWorker(QObject):
                 else:
                     combo_assessment = "连击较少，需要提高点击精准度"
 
-                # 得分评估
-                max_possible = 500 if game_mode == "find_difference" else 800
+                # 得分评估（满分基准按分钟线性放大：找茬 1 分钟 500，5 分钟 2500，10 分钟 5000）
+                minutes = max(1, int(duration_minutes or 1))
+                max_possible = (500 if game_mode == "find_difference" else 100) * minutes
                 score_ratio = game_score / max_possible if max_possible > 0 else 0
                 if score_ratio >= 0.8:
                     score_assessment = "游戏得分非常出色！"
@@ -249,7 +282,8 @@ class AIThreadWorker(QObject):
             analysis = "📊 训练数据概览\n"
             analysis += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             analysis += f"• 🧠 平均注意力分数：{avg_attention}/100\n"
-            analysis += f"• 👁️ 总眨眼次数：{total_blinks}次\n"
+            blink_rate = total_blinks / duration_minutes if duration_minutes > 0 else 0
+            analysis += f"• 👁️ 每分钟眨眼次数：{int(round(blink_rate))}次（共{total_blinks}次）\n"
             analysis += f"• ⚡ 最高连击：{max_consecutive_hits}次\n"
             analysis += f"• 🎮 游戏得分：{game_score}分\n"
             analysis += f"• 🎲 游戏模式：{mode_name}\n"

@@ -1,8 +1,11 @@
 # main.py - 程序入口
 
+import os
 import sys
 import signal
 import traceback
+import ctypes
+from ctypes import wintypes
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -47,9 +50,85 @@ def cleanup_resources():
     print("Cleanup completed")
 
 
+def detect_ui_scale() -> float:
+    """按主屏逻辑分辨率计算全局界面缩放比例（以 1920x1080 为基准）。
+
+    覆盖市面上常见笔记本/显示器逻辑分辨率：
+      - 16 英寸 2560x1600 @125% → 2048x1280，比例 1.0（保持原设计）
+      - 15.6 英寸 1920x1080 @100% → 1920x1080，比例 1.0
+      - 14 英寸 1920x1080 @125% → 1536x864，约 0.80
+      - 14 英寸 1920x1080 @150% → 1280x720，约 0.67
+      - 14 英寸 2880x1800 @200% → 1440x900，约 0.75（宽度受限）
+      - 13.3 英寸 2560x1600 @200% → 1280x800，约 0.67（宽度受限）
+      - 老款 1366x768 @100% → 1366x768，约 0.71
+    比例下限 0.6，避免极端小屏下界面过小无法操作；计算失败时返回 1.0。
+    """
+    try:
+        user32 = ctypes.windll.user32
+
+        class DEVMODE(ctypes.Structure):
+            _fields_ = [
+                ("dmDeviceName", ctypes.c_wchar * 32),
+                ("dmSpecVersion", wintypes.WORD),
+                ("dmDriverVersion", wintypes.WORD),
+                ("dmSize", wintypes.WORD),
+                ("dmDriverExtra", wintypes.WORD),
+                ("dmFields", ctypes.c_uint),
+                ("dmPosition", ctypes.c_long * 2),
+                ("dmDisplayOrientation", ctypes.c_uint),
+                ("dmDisplayFixedOutput", ctypes.c_uint),
+                ("dmColor", ctypes.c_short),
+                ("dmDuplex", ctypes.c_short),
+                ("dmYResolution", ctypes.c_short),
+                ("dmTTOption", ctypes.c_short),
+                ("dmCollate", ctypes.c_short),
+                ("dmFormName", ctypes.c_wchar * 32),
+                ("dmLogPixels", wintypes.WORD),
+                ("dmBitsPerPel", ctypes.c_uint),
+                ("dmPelsWidth", ctypes.c_uint),
+                ("dmPelsHeight", ctypes.c_uint),
+                ("dmDisplayFlags", ctypes.c_uint),
+                ("dmDisplayFrequency", ctypes.c_uint),
+                ("dmICMMethod", ctypes.c_uint),
+                ("dmICMIntent", ctypes.c_uint),
+                ("dmMediaType", ctypes.c_uint),
+                ("dmDitherType", ctypes.c_uint),
+                ("dmReserved1", ctypes.c_uint),
+                ("dmReserved2", ctypes.c_uint),
+                ("dmPanningWidth", ctypes.c_uint),
+                ("dmPanningHeight", ctypes.c_uint),
+            ]
+
+        dm = DEVMODE()
+        dm.dmSize = ctypes.sizeof(DEVMODE)
+        if not user32.EnumDisplaySettingsW(None, -1, ctypes.byref(dm)):
+            return 1.0
+
+        physical_w = float(dm.dmPelsWidth)
+        physical_h = float(dm.dmPelsHeight)
+        log_pixels = float(dm.dmLogPixels or 96)
+        if physical_w <= 0 or physical_h <= 0 or log_pixels <= 0:
+            return 1.0
+
+        dpr = log_pixels / 96.0
+        logical_w = physical_w / dpr
+        logical_h = physical_h / dpr
+        scale = min(1.0, logical_w / 1920.0, logical_h / 1080.0)
+        return max(0.6, scale)
+    except Exception:
+        return 1.0
+
+
 def main():
     # 设置异常钩子
     sys.excepthook = exception_hook
+
+    # 屏幕兼容：小屏（如 14 英寸笔记本）按主屏逻辑分辨率等比缩放整个界面，
+    # 使所有窗口完整落在屏幕内、内容不被裁切；16 英寸及以上大屏不受影响。
+    scale = detect_ui_scale()
+    if scale < 1.0:
+        os.environ["QT_SCALE_FACTOR"] = f"{scale:.4f}"
+    print(f"UI scale factor: {scale:.3f}")
 
     app = QApplication(sys.argv)
     app.setApplicationName("游戏化注意力训练系统")

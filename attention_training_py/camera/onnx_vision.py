@@ -12,12 +12,14 @@ CUDA/cuBLAS/cuDNN 版本匹配），CUDA 不可用时自动回退 CPU。
 import math
 import os
 import threading
+import time
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
 from core.paths import models_dir
+from core.time_tracker import get_tracker
 
 
 YUNET_MODEL_FILE = "yunet.onnx"
@@ -279,73 +281,110 @@ class ONNXVisionEngine:
         return report
 
 
-    def detect_face(self, frame_bgr: np.ndarray) -> Optional[Dict[str, object]]:
-        """检测最大人脸，返回 {box:(x,y,w,h), landmarks:[(x,y)x5], score} 或 None。"""
+    def detect_face(
+        self, frame_bgr: np.ndarray, frame_index: Optional[int] = None
+    ) -> Optional[Dict[str, object]]:
+        """检测最大人脸，返回 {box:(x,y,w,h), landmarks:[(x,y)x5], score} 或 None。
+
+        frame_index 用于把耗时写入 time_consumed.db（按帧号还原采样节拍）。
+        """
         sess = self._init_yunet()
         if sess is None or frame_bgr is None or frame_bgr.size == 0:
             return None
         h, w = frame_bgr.shape[:2]
+        t0 = time.perf_counter()
+        ok = False
+        result = None
         try:
             blob = self._preprocess_yunet(frame_bgr)
             inp_name = sess.get_inputs()[0].name
             outs = self._run(face_model_path(), {inp_name: blob}, list(YUNET_OUTPUT_NAMES))
-            if outs is None:
-                return None
-            faces = self._decode_yunet(outs)
+            if outs is not None:
+                faces = self._decode_yunet(outs)
+                if faces is not None and len(faces) > 0:
+                    best = faces[np.argmax(faces[:, 14])]
+                    sx = w / YUNET_INPUT_W
+                    sy = h / YUNET_INPUT_H
+                    x, y = float(best[0] * sx), float(best[1] * sy)
+                    fw, fh = float(best[2] * sx), float(best[3] * sy)
+                    landmarks = [
+                        (float(best[4 + i * 2] * sx), float(best[4 + i * 2 + 1] * sy))
+                        for i in range(5)
+                    ]
+                    result = {
+                        "box": (x, y, fw, fh),
+                        "landmarks": landmarks,
+                        "score": float(best[14]),
+                    }
+                    ok = True
         except Exception as exc:
             print(f"ONNXVisionEngine: YuNet 推理失败: {exc}")
-            return None
-        if faces is None or len(faces) == 0:
-            return None
-        best = faces[np.argmax(faces[:, 14])]
-        sx = w / YUNET_INPUT_W
-        sy = h / YUNET_INPUT_H
-        x, y = float(best[0] * sx), float(best[1] * sy)
-        fw, fh = float(best[2] * sx), float(best[3] * sy)
-        landmarks = [
-            (float(best[4 + i * 2] * sx), float(best[4 + i * 2 + 1] * sy))
-            for i in range(5)
-        ]
-        return {
-            "box": (x, y, fw, fh),
-            "landmarks": landmarks,
-            "score": float(best[14]),
-        }
+        finally:
+            get_tracker().record(
+                "yunet",
+                frame_index if frame_index is not None else 0,
+                (time.perf_counter() - t0) * 1000.0,
+                ok,
+                width=w,
+                height=h,
+            )
+        return result
 
 
     def classify_eyes(
-        self, left_eye_bgr: np.ndarray, right_eye_bgr: np.ndarray
+        self,
+        left_eye_bgr: np.ndarray,
+        right_eye_bgr: np.ndarray,
+        frame_index: Optional[int] = None,
+        frame_size: Optional[Tuple[int, int]] = None,
     ) -> Tuple[float, float]:
-        """对左右眼裁剪图分类，返回 (左眼开眼概率, 右眼开眼概率)。"""
+        """对左右眼裁剪图分类，返回 (左眼开眼概率, 右眼开眼概率)。
+
+        frame_index/frame_size 用于把耗时写入 time_consumed.db。
+        """
         sess = self._session(blink_model_path())
         if sess is None:
             return 0.5, 0.5
-        batch = []
-        for crop in (left_eye_bgr, right_eye_bgr):
-            if crop is None or crop.size == 0:
-                batch.append(
-                    np.full((OCEC_INPUT_H, OCEC_INPUT_W, 3), 128, np.uint8)
-                )
-                continue
-            img = cv2.resize(crop, (OCEC_INPUT_W, OCEC_INPUT_H))
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = img.astype(np.float32) / 255.0
-            img = img.transpose(2, 0, 1)
-            batch.append(img)
-        blob = np.asarray(batch, dtype=np.float32)
+        width, height = frame_size if frame_size is not None else (0, 0)
+        t0 = time.perf_counter()
+        ok = False
+        result = (0.5, 0.5)
         try:
+            batch = []
+            for crop in (left_eye_bgr, right_eye_bgr):
+                if crop is None or crop.size == 0:
+                    batch.append(
+                        np.full((OCEC_INPUT_H, OCEC_INPUT_W, 3), 128, np.uint8)
+                    )
+                    continue
+                img = cv2.resize(crop, (OCEC_INPUT_W, OCEC_INPUT_H))
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                img = img.astype(np.float32) / 255.0
+                img = img.transpose(2, 0, 1)
+                batch.append(img)
+            blob = np.asarray(batch, dtype=np.float32)
             inp_name = sess.get_inputs()[0].name
             out = self._run(blink_model_path(), {inp_name: blob})
-            if out is None:
-                return 0.5, 0.5
-            out = out[0]
-            probs = np.asarray(out, dtype=np.float32).reshape(-1)
-            if len(probs) < 2:
-                return float(probs[0]), float(probs[0])
-            return float(probs[0]), float(probs[1])
+            if out is not None:
+                out = out[0]
+                probs = np.asarray(out, dtype=np.float32).reshape(-1)
+                if len(probs) >= 2:
+                    result = (float(probs[0]), float(probs[1]))
+                else:
+                    result = (float(probs[0]), float(probs[0]))
+                ok = True
         except Exception as exc:
             print(f"ONNXVisionEngine: OCEC 推理失败: {exc}")
-            return 0.5, 0.5
+        finally:
+            get_tracker().record(
+                "ocec",
+                frame_index if frame_index is not None else 0,
+                (time.perf_counter() - t0) * 1000.0,
+                ok,
+                width=width,
+                height=height,
+            )
+        return result
 
     @staticmethod
     def crop_eye(
@@ -487,39 +526,81 @@ class ONNXVisionEngine:
         e = np.exp(x - x.max())
         return e / e.sum()
 
-    def estimate_head_pose(self, face_bgr: np.ndarray) -> Optional[Tuple[float, float, float]]:
-        """6DRepNet 头部姿态：返回 (pitch, yaw, roll) 度。"""
+    def estimate_head_pose(
+        self,
+        face_bgr: np.ndarray,
+        frame_index: Optional[int] = None,
+        frame_size: Optional[Tuple[int, int]] = None,
+    ) -> Optional[Tuple[float, float, float]]:
+        """6DRepNet 头部姿态：返回 (pitch, yaw, roll) 度。
+
+        frame_index/frame_size 用于把耗时写入 time_consumed.db。
+        """
         sess = self._session(head_pose_model_path())
         if sess is None or face_bgr is None or face_bgr.size == 0:
             return None
+        width, height = frame_size if frame_size is not None else (0, 0)
+        t0 = time.perf_counter()
+        ok = False
+        result = None
         try:
             inp = sess.get_inputs()[0]
             blob = self._preprocess_face(face_bgr, int(inp.shape[3]), int(inp.shape[2]))
             out = self._run(head_pose_model_path(), {inp.name: blob})
-            if out is None:
-                return None
-            return self._rotation_matrix_to_euler(out[0])
+            if out is not None:
+                result = self._rotation_matrix_to_euler(out[0])
+                ok = True
         except Exception as exc:
             print(f"ONNXVisionEngine: 头部姿态推理失败: {exc}")
-            return None
+        finally:
+            get_tracker().record(
+                "head_pose",
+                frame_index if frame_index is not None else 0,
+                (time.perf_counter() - t0) * 1000.0,
+                ok,
+                width=width,
+                height=height,
+            )
+        return result
 
-    def estimate_gaze(self, face_bgr: np.ndarray) -> Optional[Tuple[float, float]]:
-        """L2CS 视线估计：返回 (yaw, pitch) 弧度。"""
+    def estimate_gaze(
+        self,
+        face_bgr: np.ndarray,
+        frame_index: Optional[int] = None,
+        frame_size: Optional[Tuple[int, int]] = None,
+    ) -> Optional[Tuple[float, float]]:
+        """L2CS 视线估计：返回 (yaw, pitch) 弧度。
+
+        frame_index/frame_size 用于把耗时写入 time_consumed.db。
+        """
         sess = self._session(gaze_model_path())
         if sess is None or face_bgr is None or face_bgr.size == 0:
             return None
+        width, height = frame_size if frame_size is not None else (0, 0)
+        t0 = time.perf_counter()
+        ok = False
+        result = None
         try:
             inp = sess.get_inputs()[0]
             blob = self._preprocess_face(face_bgr, int(inp.shape[3]), int(inp.shape[2]))
             outs = self._run(gaze_model_path(), {inp.name: blob})
-            if outs is None:
-                return None
-            yaw_logits = np.asarray(outs[0], dtype=np.float32).reshape(-1)
-            pitch_logits = np.asarray(outs[1], dtype=np.float32).reshape(-1)
-            idx = np.arange(90, dtype=np.float32)
-            yaw_deg = float(np.sum(self._softmax(yaw_logits) * idx) * 4.0 - 180.0)
-            pitch_deg = float(np.sum(self._softmax(pitch_logits) * idx) * 4.0 - 180.0)
-            return float(math.radians(yaw_deg)), float(math.radians(pitch_deg))
+            if outs is not None:
+                yaw_logits = np.asarray(outs[0], dtype=np.float32).reshape(-1)
+                pitch_logits = np.asarray(outs[1], dtype=np.float32).reshape(-1)
+                idx = np.arange(90, dtype=np.float32)
+                yaw_deg = float(np.sum(self._softmax(yaw_logits) * idx) * 4.0 - 180.0)
+                pitch_deg = float(np.sum(self._softmax(pitch_logits) * idx) * 4.0 - 180.0)
+                result = (float(math.radians(yaw_deg)), float(math.radians(pitch_deg)))
+                ok = True
         except Exception as exc:
             print(f"ONNXVisionEngine: 视线推理失败: {exc}")
-            return None
+        finally:
+            get_tracker().record(
+                "gaze",
+                frame_index if frame_index is not None else 0,
+                (time.perf_counter() - t0) * 1000.0,
+                ok,
+                width=width,
+                height=height,
+            )
+        return result

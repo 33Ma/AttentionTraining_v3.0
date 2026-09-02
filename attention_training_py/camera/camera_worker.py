@@ -7,6 +7,9 @@ import threading
 import mediapipe as mp
 from PySide6.QtCore import QObject, Signal, QTimer, QMetaObject, Qt
 from PySide6.QtGui import QImage
+from core.time_tracker import get_tracker
+from camera.onnx_pipeline import LatestMailbox, OnnxTaskWorker
+
 
 class CameraWorker(QObject):
     """摄像头工作类"""
@@ -60,6 +63,7 @@ class CameraWorker(QObject):
         self._last_blink_time = 0
         self._min_blink_interval = 5
         self._total_frames = 0
+        self._face_detected = False
 
         # 当前值
         self._current_ear = 0.0
@@ -119,8 +123,18 @@ class CameraWorker(QObject):
         self._onnx_warmup_thread = None
         self._onnx_warmup_started = False
         self._onnx_lock = threading.Lock()
+        # ONNX 后台推理（第三步：推理移出采集线程，latest-wins）
+        self._onnx_mailbox = None
+        self._onnx_worker = None
+        self._onnx_worker_thread = None
+        self._onnx_stop = threading.Event()
 
         print("CameraWorker initialized")
+
+    @property
+    def face_seen(self) -> bool:
+        """Whether a face was detected at least once during training."""
+        return self._face_detected
 
     def set_ear_threshold(self, value: float):
         """设置EAR闭眼检测阈值"""
@@ -164,10 +178,23 @@ class CameraWorker(QObject):
             self._onnx_blink_enabled = False
             self._onnx_head_pose_enabled = False
             self._onnx_gaze_enabled = False
+        get_tracker().set_config(
+            [
+                name
+                for name, enabled in (
+                    ("face", self._onnx_face_enabled),
+                    ("blink", self._onnx_blink_enabled),
+                    ("head_pose", self._onnx_head_pose_enabled),
+                    ("gaze", self._onnx_gaze_enabled),
+                )
+                if enabled
+            ]
+        )
         print(f"ONNX vision: face={self._onnx_face_enabled} blink={self._onnx_blink_enabled} head_pose={self._onnx_head_pose_enabled} gaze={self._onnx_gaze_enabled}")
 
         # 后台预热 ONNX 引擎，摄像头立即开始出帧，模型就绪后自动切换
         self._start_onnx_warmup()
+        self._start_onnx_worker()
 
         if self._running:
             print("Camera already running")
@@ -202,6 +229,13 @@ class CameraWorker(QObject):
         print("CameraWorker.stop_capture called")
 
         self._running = False
+
+        if self._onnx_worker_thread is not None:
+            self._onnx_stop.set()
+            self._onnx_worker_thread.join(timeout=1.0)
+            self._onnx_worker_thread = None
+            self._onnx_worker = None
+            self._onnx_mailbox = None
 
         if self._timer:
             QMetaObject.invokeMethod(self._timer, "stop", Qt.QueuedConnection)
@@ -265,6 +299,81 @@ class CameraWorker(QObject):
             self._onnx_warned.add(key)
             print(f"CameraWorker: {message}")
 
+    def _start_onnx_worker(self):
+        """启动后台 ONNX 推理线程（latest-wins：只处理最新一帧，丢弃积压）。"""
+        enabled = {
+            name
+            for name, flag in (
+                ("face", self._onnx_face_enabled),
+                ("blink", self._onnx_blink_enabled),
+                ("head_pose", self._onnx_head_pose_enabled),
+                ("gaze", self._onnx_gaze_enabled),
+            )
+            if flag
+        }
+        if not enabled:
+            return
+        if self._onnx_worker_thread is not None:
+            return
+        self._onnx_stop = threading.Event()
+        self._onnx_mailbox = LatestMailbox()
+        self._onnx_worker = OnnxTaskWorker(
+            enabled=enabled,
+            mailbox=self._onnx_mailbox,
+            stop_event=self._onnx_stop,
+            runner=self._run_onnx_model,
+        )
+        thread = threading.Thread(
+            target=self._onnx_worker.run, name="onnx-inference", daemon=True
+        )
+        self._onnx_worker_thread = thread
+        thread.start()
+        print(f"CameraWorker: ONNX 后台推理线程已启动 {sorted(enabled)}")
+
+    def _run_onnx_model(self, model, frame, landmarks, w, h, frame_index):
+        """后台推理线程执行单个模型，结果写入缓存属性（采集线程只读缓存）。"""
+        if model == "face":
+            with self._onnx_lock:
+                self._onnx_last_face = self._detect_face_onnx(frame, frame_index)
+        elif model == "head_pose":
+            with self._onnx_lock:
+                onnx_face = self._onnx_last_face
+            face_crop = self._get_face_crop(frame, landmarks, w, h, onnx_face)
+            with self._onnx_lock:
+                self._onnx_head_pose = self._estimate_head_pose_onnx(
+                    face_crop, w, h, frame_index
+                )
+        elif model == "gaze":
+            with self._onnx_lock:
+                onnx_face = self._onnx_last_face
+            face_crop = self._get_face_crop(frame, landmarks, w, h, onnx_face)
+            with self._onnx_lock:
+                self._onnx_gaze = self._estimate_gaze_onnx(
+                    face_crop, w, h, frame_index
+                )
+        elif model == "blink":
+            left_eye_pts = self._get_eye_points(
+                landmarks, self.LEFT_EYE_INDICES, w, h, normalize=False
+            )
+            right_eye_pts = self._get_eye_points(
+                landmarks, self.RIGHT_EYE_INDICES, w, h, normalize=False
+            )
+            with self._onnx_lock:
+                self._onnx_prob_open = self._classify_eyes_onnx(
+                    frame, left_eye_pts, right_eye_pts, frame_index
+                )
+
+    def _publish_onnx_task(self, frame, results):
+        """把最新帧投递给后台推理线程；只保留最新任务，丢弃积压。"""
+        mailbox = self._onnx_mailbox
+        if mailbox is None:
+            return
+        landmarks = None
+        if results.multi_face_landmarks:
+            landmarks = results.multi_face_landmarks[0].landmark
+        h, w = frame.shape[:2]
+        mailbox.publish((self._total_frames, frame, landmarks, w, h))
+
     def _start_onnx_warmup(self):
         """在后台线程初始化 ONNX 视觉引擎，不阻塞摄像头打开与帧循环。"""
         if not (self._onnx_face_enabled or self._onnx_blink_enabled
@@ -325,11 +434,13 @@ class CameraWorker(QObject):
                   f"blink={self._onnx_blink_ok} head_pose={self._onnx_head_pose_ok} "
                   f"gaze={self._onnx_gaze_ok}")
 
-    def _detect_face_onnx(self, frame):
+    def _detect_face_onnx(self, frame, frame_index):
         if not self._onnx_face_ok or self._onnx_engine is None:
             return None
         try:
-            result = self._onnx_engine.detect_face(frame)
+            result = self._onnx_engine.detect_face(
+                frame, frame_index=frame_index
+            )
             self._onnx_face_infer_errors = 0
             return result
         except Exception as exc:
@@ -340,7 +451,7 @@ class CameraWorker(QObject):
                 self._warn_once("face_infer_disable", "ONNX 人脸检测连续失败，回退 MediaPipe")
             return None
 
-    def _classify_eyes_onnx(self, frame, left_eye_pts, right_eye_pts) -> float:
+    def _classify_eyes_onnx(self, frame, left_eye_pts, right_eye_pts, frame_index) -> float:
         """用 OCEC 分类双眼，返回平均开眼概率。"""
         if not self._onnx_blink_ok or self._onnx_engine is None:
             return 0.5
@@ -352,7 +463,12 @@ class CameraWorker(QObject):
             ref = math.hypot(right_cx - left_cx, right_cy - left_cy)
             left_crop = self._onnx_engine.crop_eye(frame, (left_cx, left_cy), ref)
             right_crop = self._onnx_engine.crop_eye(frame, (right_cx, right_cy), ref)
-            p_left, p_right = self._onnx_engine.classify_eyes(left_crop, right_crop)
+            p_left, p_right = self._onnx_engine.classify_eyes(
+                left_crop,
+                right_crop,
+                frame_index=frame_index,
+                frame_size=(frame.shape[1], frame.shape[0]),
+            )
             return (p_left + p_right) / 2.0
         except Exception as exc:
             self._warn_once("blink_infer", f"ONNX 眨眼检测失败: {exc}")
@@ -377,20 +493,28 @@ class CameraWorker(QObject):
             return None
         return frame[y0:y1, x0:x1]
 
-    def _estimate_head_pose_onnx(self, face_crop):
+    def _estimate_head_pose_onnx(self, face_crop, width, height, frame_index):
         if not self._onnx_head_pose_ok or self._onnx_engine is None or face_crop is None:
             return None
         try:
-            return self._onnx_engine.estimate_head_pose(face_crop)
+            return self._onnx_engine.estimate_head_pose(
+                face_crop,
+                frame_index=frame_index,
+                frame_size=(width, height),
+            )
         except Exception as exc:
             self._warn_once("head_pose_infer", f"ONNX \u5934\u90e8\u59ff\u6001\u63a8\u7406\u5931\u8d25: {exc}")
             return None
 
-    def _estimate_gaze_onnx(self, face_crop):
+    def _estimate_gaze_onnx(self, face_crop, width, height, frame_index):
         if not self._onnx_gaze_ok or self._onnx_engine is None or face_crop is None:
             return None
         try:
-            return self._onnx_engine.estimate_gaze(face_crop)
+            return self._onnx_engine.estimate_gaze(
+                face_crop,
+                frame_index=frame_index,
+                frame_size=(width, height),
+            )
         except Exception as exc:
             self._warn_once("gaze_infer", f"ONNX \u89c6\u7ebf\u63a8\u7406\u5931\u8d25: {exc}")
             return None
@@ -409,6 +533,7 @@ class CameraWorker(QObject):
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self._face_mesh.process(rgb)
+        self._publish_onnx_task(frame, results)
 
         ear = 0.0
         blink_count = self._blink_counter
@@ -419,14 +544,14 @@ class CameraWorker(QObject):
         mp_face = bool(results.multi_face_landmarks)
         onnx_face = self._onnx_last_face
         if self._onnx_face_enabled and self._onnx_face_ok:
-            # YuNet 每4帧检测一次，中间帧复用缓存的人脸框
-            if self._total_frames % 4 == 1:
-                self._onnx_last_face = self._detect_face_onnx(frame)
-                onnx_face = self._onnx_last_face
+            # 人脸框由后台推理线程按节拍更新，采集线程只读缓存结果
             face_present = onnx_face is not None
         else:
             # ONNX 未就绪/不可用时回退 MediaPipe，避免训练期间误报“未检测到人脸”
             face_present = mp_face
+
+        if face_present:
+            self._face_detected = True
 
         if not face_present:
             cv2.putText(display, "No face detected", (10, 30),
@@ -447,16 +572,8 @@ class CameraWorker(QObject):
         landmarks = results.multi_face_landmarks[0].landmark
         h, w, _ = frame.shape
 
-        # Stage 3+4: 头部姿态/视线各每6帧跑一次并错开不同帧，中间帧复用缓存结果
-        if self._onnx_head_pose_enabled or self._onnx_gaze_enabled:
-            if self._total_frames % 6 == 1:
-                if self._onnx_head_pose_enabled and self._onnx_head_pose_ok:
-                    face_crop = self._get_face_crop(frame, landmarks, w, h, onnx_face)
-                    self._onnx_head_pose = self._estimate_head_pose_onnx(face_crop)
-            elif self._total_frames % 6 == 4:
-                if self._onnx_gaze_enabled and self._onnx_gaze_ok:
-                    face_crop = self._get_face_crop(frame, landmarks, w, h, onnx_face)
-                    self._onnx_gaze = self._estimate_gaze_onnx(face_crop)
+        # 头部姿态/视线推理由后台线程按节拍完成，采集线程直接读缓存结果
+
 
         # 获取眼部关键点（像素坐标）
         left_eye_pts = self._get_eye_points(landmarks, self.LEFT_EYE_INDICES, w, h, normalize=False)
@@ -538,8 +655,8 @@ class CameraWorker(QObject):
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
             if self._onnx_blink_enabled and self._onnx_blink_ok:
-                # OCEC 每帧分类一次，避免采样间隔漏掉快速眨眼
-                self._onnx_prob_open = self._classify_eyes_onnx(frame, left_eye_pts, right_eye_pts)
+                # OCEC 结果由后台推理线程按节拍更新，采集线程直接用缓存概率，
+                # EAR 仍逐帧计算，避免漏掉快速眨眼
                 prob_open = self._onnx_prob_open
                 ear_for_score = 0.12 + 0.22 * prob_open
                 blink_detected = self._detect_blink_prob(prob_open)

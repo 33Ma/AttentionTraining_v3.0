@@ -13,6 +13,7 @@ import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.paths import models_dir
+from .composite_scoring import camera_measured, composite_score
 
 
 SESSION_MODEL_FILE = "session_analysis.onnx"
@@ -102,6 +103,37 @@ class LocalAnalysisEngine:
             and self._session(RECOMMEND_MODEL_FILE) is not None
         )
 
+    def warmup(self) -> bool:
+        """预加载两个分析模型会话并各执行一次推理，缓存 session，避免首次分析冷启动。
+
+        模型缺失 / onnxruntime 不可用 / 推理失败时返回 False，不影响既有回退逻辑。
+        """
+        if not self._load():
+            return False
+        try:
+            import numpy as np
+        except Exception as exc:
+            print(f"LocalAnalysisEngine: 预热缺少 numpy: {exc}")
+            return False
+        ok = True
+        for model_file, width in (
+            (SESSION_MODEL_FILE, 7),
+            (RECOMMEND_MODEL_FILE, 6),
+        ):
+            try:
+                sess = self._session(model_file)
+                if sess is None:
+                    ok = False
+                    continue
+                feeds = {
+                    sess.get_inputs()[0].name: np.zeros((1, width), dtype=np.float32)
+                }
+                sess.run(None, feeds)
+            except Exception as exc:
+                print(f"LocalAnalysisEngine: 预热 {model_file} 失败: {exc}")
+                ok = False
+        return ok
+
     # ------------------------------------------------------------------
     # 特征构造
     # ------------------------------------------------------------------
@@ -110,8 +142,10 @@ class LocalAnalysisEngine:
         return max(0.0, min(1.0, float(value)))
 
     @staticmethod
-    def _score_ratio(game_score: int, game_mode: str) -> float:
-        max_possible = 500 if game_mode == "find_difference" else 800
+    def _score_ratio(game_score: int, game_mode: str, duration_minutes: int = 1) -> float:
+        # 找茬模式满分基准按分钟线性放大：1 分钟 500，5 分钟 2500，10 分钟 5000。
+        max_possible = 500 if game_mode == "find_difference" else 100
+        max_possible *= max(1, int(duration_minutes or 1))
         return (game_score / max_possible) if max_possible > 0 else 0.0
 
     def _session_features(
@@ -130,14 +164,15 @@ class LocalAnalysisEngine:
             self._clamp01(avg_attention / 100.0),
             self._clamp01(blink_rate / 45.0),
             self._clamp01(max_consecutive_hits / 30.0),
-            self._clamp01(self._score_ratio(game_score, game_mode)),
+            self._clamp01(self._score_ratio(game_score, game_mode, duration_minutes)),
             self._clamp01(duration_minutes / 30.0),
             self._clamp01(avg_gaze_score / 100.0),
             self._clamp01(avg_gaze_distance),
         ]
 
     def _recommend_features(self, history: List[Dict[str, Any]]) -> Optional[List[float]]:
-        records = [r for r in history if isinstance(r, dict)][-10:]
+        # history 约定为“新→旧”（与 Database.fetch_training_records 一致），取最近 10 条
+        records = [r for r in history if isinstance(r, dict)][:10]
         if not records:
             return None
 
@@ -146,7 +181,8 @@ class LocalAnalysisEngine:
 
         def ratio(r: Dict[str, Any]) -> float:
             mode = r.get("game_mode") or "find_difference"
-            max_possible = 500 if mode == "find_difference" else 800
+            minutes = max(1, int(r.get("duration_minutes") or 1))
+            max_possible = (500 if mode == "find_difference" else 100) * minutes
             score = float(r.get("game_score") or 0)
             return self._clamp01(score / max_possible) if max_possible else 0.0
 
@@ -228,9 +264,9 @@ class LocalAnalysisEngine:
     # ------------------------------------------------------------------
     @staticmethod
     def _rule_attention(avg_attention: int) -> int:
-        if avg_attention >= 80:
+        if avg_attention >= 90:
             return 4
-        if avg_attention >= 65:
+        if avg_attention >= 75:
             return 3
         if avg_attention >= 50:
             return 2
@@ -248,13 +284,13 @@ class LocalAnalysisEngine:
 
     @staticmethod
     def _rule_performance(score_ratio: float) -> int:
-        if score_ratio >= 0.8:
+        if score_ratio >= 0.9:
             return 4
-        if score_ratio >= 0.6:
+        if score_ratio >= 0.75:
             return 3
-        if score_ratio >= 0.4:
+        if score_ratio >= 0.5:
             return 2
-        if score_ratio >= 0.2:
+        if score_ratio >= 0.3:
             return 1
         return 0
 
@@ -293,11 +329,13 @@ class LocalAnalysisEngine:
         duration_minutes: int,
         avg_gaze_score: int = 0,
         avg_gaze_distance: float = 0.0,
+        difficulty: str = "normal",
+        face_detected: Optional[bool] = None,
         use_model: bool = True,
     ) -> str:
         """生成训练分析报告；优先使用 ONNX 模型，不可用时回退规则模板。"""
         blink_rate = (total_blinks / duration_minutes) if duration_minutes > 0 else 0.0
-        score_ratio = self._score_ratio(game_score, game_mode)
+        score_ratio = self._score_ratio(game_score, game_mode, duration_minutes)
 
         prediction = None
         if use_model:
@@ -327,6 +365,8 @@ class LocalAnalysisEngine:
             duration_minutes=duration_minutes,
             avg_gaze_score=avg_gaze_score,
             avg_gaze_distance=avg_gaze_distance,
+            difficulty=difficulty,
+            face_detected=face_detected,
             attention_idx=prediction["attention_level"],
             fatigue_idx=prediction["fatigue"],
             performance_idx=prediction["performance"],
@@ -356,6 +396,8 @@ class LocalAnalysisEngine:
         duration_minutes: int,
         avg_gaze_score: int,
         avg_gaze_distance: float,
+        difficulty: str = "normal",
+        face_detected: Optional[bool] = None,
         attention_idx: int,
         fatigue_idx: int,
         performance_idx: int,
@@ -368,7 +410,7 @@ class LocalAnalysisEngine:
         score_status = f"{PERFORMANCE_LEVEL_EMOJI[performance_idx]} {PERFORMANCE_LEVEL_NAMES[performance_idx]}"
 
         # 连击评估（规则）
-        if max_consecutive_hits >= 20:
+        if max_consecutive_hits >= 25:
             combo_status = "🏆 完美"
         elif max_consecutive_hits >= 15:
             combo_status = "⭐ 优秀"
@@ -406,7 +448,7 @@ class LocalAnalysisEngine:
         analysis += "📊 训练数据概览\n"
         analysis += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         analysis += f"• 🧠 平均注意力分数：{avg_attention}/100（{attention_level}）\n"
-        analysis += f"• 👁️ 总眨眼次数：{total_blinks}次（频率：{int(round(blink_rate))}次/分钟，状态：{fatigue_status}）\n"
+        analysis += f"• 👁️ 每分钟眨眼次数：{int(round(blink_rate))}次（共{total_blinks}次，状态：{fatigue_status}）\n"
         analysis += f"• ⚡ 最高连击：{max_consecutive_hits}次（{combo_status}）\n"
         analysis += f"• 🎮 游戏得分：{game_score}分（{score_status}）\n"
         analysis += f"• 🎲 游戏模式：{mode_name}\n"
@@ -459,36 +501,20 @@ class LocalAnalysisEngine:
             analysis += "   💡 建议：继续保持良好的注视习惯！\n"
 
         # 综合评分（规则）
-        overall_score = 0
-        if avg_attention >= 70:
-            overall_score += 30
-        elif avg_attention >= 50:
-            overall_score += 20
-        else:
-            overall_score += 10
-
-        if max_consecutive_hits >= 15:
-            overall_score += 25
-        elif max_consecutive_hits >= 8:
-            overall_score += 15
-        elif max_consecutive_hits >= 3:
-            overall_score += 8
-
-        if score_ratio >= 0.6:
-            overall_score += 25
-        elif score_ratio >= 0.3:
-            overall_score += 15
-        else:
-            overall_score += 5
-
-        if avg_gaze_score >= 75:
-            overall_score += 20
-        elif avg_gaze_score >= 55:
-            overall_score += 12
-        else:
-            overall_score += 5
-
+        # composite score: continuous weights, renormalized when camera data is missing
+        overall_score = composite_score(
+            avg_attention=avg_attention,
+            max_consecutive_hits=max_consecutive_hits,
+            game_score=game_score,
+            game_mode=game_mode,
+            difficulty=difficulty,
+            avg_gaze_score=avg_gaze_score,
+            face_detected=face_detected,
+            duration_minutes=duration_minutes,
+        )
         analysis += f"\n🏆 综合评分：{overall_score}/100\n"
+        if not camera_measured(avg_attention, avg_gaze_score, face_detected):
+            analysis += "（未启用摄像头或未检测到人脸，综合评分仅按游戏表现计算）\n"
         if overall_score >= 80:
             analysis += "🌟🌟🌟🌟🌟 卓越表现！你是注意力训练大师！\n"
         elif overall_score >= 65:
@@ -510,7 +536,10 @@ class LocalAnalysisEngine:
 
         target_attention = min(100, avg_attention + 15)
         target_combo = max_consecutive_hits + 5
-        target_score = int(game_score * 1.2)
+        target_score = (
+            min(100, int(game_score * 1.2))
+            if game_mode == "dynamic_tracking" else int(game_score * 1.2)
+        )
         target_gaze = min(100, avg_gaze_score + 10)
 
         analysis += "\n🎯 下次训练目标\n"

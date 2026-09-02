@@ -62,6 +62,12 @@ class TrainingRecord:
         self.avg_ear: float = 0.0
         self.avg_gaze_score: int = 0
         self.avg_gaze_distance: float = 0.0
+        self.max_consecutive_hits: int = 0
+        self.face_detected: int = -1
+        self.hit_rate: float = 0.0
+        self.avg_response_time: float = 0.0
+        self.path_efficiency: float = 0.0
+        self.composite_score: int = -1
 
     def to_dict(self) -> dict:
         return {
@@ -74,7 +80,13 @@ class TrainingRecord:
             'game_score': self.game_score,
             'avg_ear': self.avg_ear,
             'avg_gaze_score': self.avg_gaze_score,
-            'avg_gaze_distance': self.avg_gaze_distance
+            'avg_gaze_distance': self.avg_gaze_distance,
+            'max_consecutive_hits': self.max_consecutive_hits,
+            'face_detected': self.face_detected,
+            'hit_rate': self.hit_rate,
+            'avg_response_time': self.avg_response_time,
+            'path_efficiency': self.path_efficiency,
+            'composite_score': self.composite_score
         }
 
     @classmethod
@@ -91,6 +103,12 @@ class TrainingRecord:
         record.avg_ear = data.get('avg_ear', 0.0)
         record.avg_gaze_score = int(data.get('avg_gaze_score', 0))
         record.avg_gaze_distance = float(data.get('avg_gaze_distance', 0.0))
+        record.max_consecutive_hits = int(data.get('max_consecutive_hits', 0))
+        record.face_detected = int(data.get('face_detected', -1))
+        record.hit_rate = float(data.get('hit_rate', 0.0))
+        record.avg_response_time = float(data.get('avg_response_time', 0.0))
+        record.path_efficiency = float(data.get('path_efficiency', 0.0))
+        record.composite_score = int(data.get('composite_score', -1))
         return record
 
 
@@ -116,7 +134,7 @@ class GlobalSettings(QObject):
         self._db = Database()
         self.users_dir = users_dir()
 
-        self._current_user = "默认用户"
+        self._current_user = ""
         self._settings: Optional[QSettings] = None
         self._user_settings_cache: Dict[str, QSettings] = {}
 
@@ -193,7 +211,10 @@ class GlobalSettings(QObject):
                         'game_score': int(settings.value("gameScore", 0)),
                         'avg_ear': float(settings.value("avgEAR", 0.0)),
                         'avg_gaze_score': int(settings.value("avgGazeScore", 0)),
-                        'avg_gaze_distance': float(settings.value("avgGazeDistance", 0.0))
+                        'avg_gaze_distance': float(settings.value("avgGazeDistance", 0.0)),
+                        'max_consecutive_hits': int(settings.value("maxConsecutiveHits", 0)),
+                        'face_detected': int(settings.value("faceDetected", -1)),
+                        'composite_score': int(settings.value("compositeScore", -1))
                     }
                 else:
                     data = {
@@ -206,7 +227,10 @@ class GlobalSettings(QObject):
                         'game_score': int(settings.value("game_score", 0)),
                         'avg_ear': float(settings.value("avg_ear", 0.0)),
                         'avg_gaze_score': int(settings.value("avg_gaze_score", 0)),
-                        'avg_gaze_distance': float(settings.value("avg_gaze_distance", 0.0))
+                        'avg_gaze_distance': float(settings.value("avg_gaze_distance", 0.0)),
+                        'max_consecutive_hits': int(settings.value("max_consecutive_hits", 0)),
+                        'face_detected': int(settings.value("face_detected", -1)),
+                        'composite_score': int(settings.value("composite_score", -1))
                     }
 
                 record = TrainingRecord.from_dict(data)
@@ -258,6 +282,9 @@ class GlobalSettings(QObject):
                 settings.setValue("avg_ear", record.avg_ear)
                 settings.setValue("avg_gaze_score", record.avg_gaze_score)
                 settings.setValue("avg_gaze_distance", record.avg_gaze_distance)
+                settings.setValue("max_consecutive_hits", record.max_consecutive_hits)
+                settings.setValue("face_detected", record.face_detected)
+                settings.setValue("composite_score", record.composite_score)
         finally:
             settings.endArray()
         settings.sync()
@@ -269,9 +296,7 @@ class GlobalSettings(QObject):
             for item in os.listdir(self.users_dir):
                 if os.path.isdir(os.path.join(self.users_dir, item)):
                     self._users.append(item)
-        if not self._users:
-            self._users = ["默认用户"]
-            os.makedirs(os.path.join(self.users_dir, "默认用户"), exist_ok=True)
+        # 多用户模式下没有“默认用户”，空目录即为空列表
 
     def _load_current_user_settings(self):
         """加载当前用户设置"""
@@ -295,8 +320,8 @@ class GlobalSettings(QObject):
         if isinstance(custom_data, dict):
             self._custom_difficulty = CustomDifficulty.from_dict(custom_data)
 
-        self._api_key = settings.value("ai/api_key", "")
-        self._api_url = settings.value("ai/api_url", "https://api.openai.com/v1/chat/completions")
+        self._api_key = str(settings.value("ai/api_key", "") or "").strip()
+        self._api_url = str(settings.value("ai/api_url", "https://api.openai.com/v1/chat/completions") or "").strip()
         self._ai_enabled = settings.value("ai/ai_enabled", False, type=bool)
         self._ai_model = settings.value("ai/ai_model", "gpt-3.5-turbo")
         self._local_analysis_enabled = settings.value("ai/local_analysis_enabled", True, type=bool)
@@ -339,7 +364,6 @@ class GlobalSettings(QObject):
         settings.setValue("wallpaper/enabled", self._wallpaper_enabled)
         settings.setValue("wallpaper/force_standard_in_training", self._force_standard_bg_in_training)
 
-        self._save_training_records()
         settings.sync()
 
     def _load_training_records(self):
@@ -467,8 +491,6 @@ class GlobalSettings(QObject):
             self._save_current_user_settings()
 
     def delete_user(self, username: str):
-        if username == "默认用户":
-            return
         if username in self._users:
             self._users.remove(username)
             user_dir = os.path.join(self.users_dir, username)
@@ -476,7 +498,7 @@ class GlobalSettings(QObject):
             if os.path.exists(user_dir):
                 shutil.rmtree(user_dir)
             if self._current_user == username:
-                self.set_current_user("默认用户")
+                self.set_current_user("")
 
     # ========== Getter/Setter ==========
 
@@ -594,45 +616,60 @@ class GlobalSettings(QObject):
             return self.auto_difficulty_level()
         return self._difficulty_level
 
+    # 点出现间隔：简单/普通/困难统一速度，仅自定义难度可单独设置。
     def get_spot_interval(self) -> int:
         level = self.effective_difficulty_level()
-        if level == DifficultyLevel.EASY:
-            return 2500
-        elif level == DifficultyLevel.HARD:
-            return 800
-        elif level == DifficultyLevel.CUSTOM:
+        if level == DifficultyLevel.CUSTOM:
             return self._custom_difficulty.spot_speed
         return 1500
 
+    def get_track_interval(self) -> int:
+        level = self.effective_difficulty_level()
+        if level == DifficultyLevel.CUSTOM:
+            return self._custom_difficulty.track_speed
+        return 1500
+
+    # 点大小：随难度变化并拉开差距（简单最大，困难最小）。
     def get_spot_size(self) -> int:
         level = self.effective_difficulty_level()
         if level == DifficultyLevel.EASY:
-            return 40
+            return 50
         elif level == DifficultyLevel.HARD:
-            return 20
+            return 12
         elif level == DifficultyLevel.CUSTOM:
             return self._custom_difficulty.spot_size
-        return 30
-
-    def get_track_interval(self) -> int:
-        level = self.effective_difficulty_level()
-        if level == DifficultyLevel.EASY:
-            return 2500
-        elif level == DifficultyLevel.HARD:
-            return 700
-        elif level == DifficultyLevel.CUSTOM:
-            return self._custom_difficulty.track_speed
-        return 1500
+        return 24  # 路线 B：普通难度点大小定为 24px
 
     def get_track_size(self) -> int:
         level = self.effective_difficulty_level()
         if level == DifficultyLevel.EASY:
-            return 30
+            return 40
         elif level == DifficultyLevel.HARD:
-            return 12
+            return 8
         elif level == DifficultyLevel.CUSTOM:
             return self._custom_difficulty.track_size
         return 20
+
+    # 点出现位置随机性（0.0 = 集中在中心，1.0 = 全区域随机）：随难度变化且更剧烈。
+    def get_spot_position_randomness(self) -> float:
+        level = self.effective_difficulty_level()
+        if level == DifficultyLevel.EASY:
+            return 0.2
+        elif level == DifficultyLevel.HARD:
+            return 1.0
+        elif level == DifficultyLevel.CUSTOM:
+            return 1.0
+        return 0.6
+
+    def get_track_position_randomness(self) -> float:
+        level = self.effective_difficulty_level()
+        if level == DifficultyLevel.EASY:
+            return 0.2
+        elif level == DifficultyLevel.HARD:
+            return 1.0
+        elif level == DifficultyLevel.CUSTOM:
+            return 1.0
+        return 0.6
 
     def api_key(self) -> str:
         return self._api_key
@@ -725,10 +762,10 @@ class GlobalSettings(QObject):
         return self._training_records.copy()
 
     def add_training_record(self, record: TrainingRecord):
+        if not self._current_user:
+            return
         self._training_records.insert(0, record)
-        if len(self._training_records) > 100:
-            self._training_records = self._training_records[:100]
-        self._save_training_records()
+        self._db.insert_training_record(self._current_user, record.to_dict())
         self.training_records_changed.emit()
 
     def clear_training_records(self):
@@ -745,16 +782,9 @@ class GlobalSettings(QObject):
     def add_training_record_for_user(self, username: str, record: TrainingRecord):
         if not username:
             return
-        records = self.training_records_for_user(username)
-        records.insert(0, record)
-        if len(records) > 100:
-            records = records[:100]
-        self._db.replace_training_records(
-            username,
-            [item.to_dict() for item in records],
-        )
+        self._db.insert_training_record(username, record.to_dict())
         if username == self._current_user:
-            self._training_records = records
+            self._training_records.insert(0, record)
         self.training_records_changed.emit()
 
     def clear_training_records_for_user(self, username: str):
